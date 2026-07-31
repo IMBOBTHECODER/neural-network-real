@@ -1,5 +1,11 @@
 import numpy as np
+try:
+    import cupy as xp
+except ImportError:
+    import numpy as xp
+
 import time
+import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
@@ -11,20 +17,20 @@ class DataLoader:
         self.Y = Y
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.num_classes = np.max(Y) + 1
+        self.num_classes = int(xp.max(Y).item()) + 1
 
     def __iter__(self):
-        indices = np.arange(len(self.X))
+        indices = xp.arange(len(self.X))
 
         if self.shuffle:
-            np.random.shuffle(indices)
+            xp.random.shuffle(indices)
 
         for start in range(0, len(indices), self.batch_size):
             batch = indices[start:start + self.batch_size]
 
             x = self.X[batch]
 
-            y = np.eye(self.num_classes, dtype=np.float32)[self.Y[batch]]
+            y = xp.eye(self.num_classes, dtype=xp.float32)[self.Y[batch]]
 
             yield x, y
 
@@ -58,52 +64,52 @@ class NeuralNetwork():
 
         self.weights = [
             (
-                np.random.randn(self.layers[i], self.layers[i + 1]).astype(np.float32)
-                * np.float32(np.sqrt(2.0 / self.layers[i]))
+                xp.random.randn(self.layers[i], self.layers[i + 1]).astype(xp.float32)
+                * xp.float32(xp.sqrt(2.0 / self.layers[i]))
             )
             for i in range(self.size - 1)
         ]
 
         # Biases set to zero first
         self.biases = [
-            np.zeros(self.layers[i + 1], dtype=np.float32)
+            xp.zeros(self.layers[i + 1], dtype=xp.float32)
             for i in range(self.size - 1)
         ]
 
         # Value after activation
         self.activations = [
-            np.empty((batch_size, size), dtype=np.float32)
+            xp.empty((batch_size, size), dtype=xp.float32)
             for size in self.layers
         ]
 
         # Value before activation
         self.logits = [
-            np.empty((batch_size, size), dtype=np.float32)
+            xp.empty((batch_size, size), dtype=xp.float32)
             for size in self.layers[1:]
         ]
 
         # Adam's momentum and variance
         self.weight_m = [
-            np.zeros_like(w)
+            xp.zeros_like(w)
             for w in self.weights
         ]
 
         self.weight_v = [
-            np.zeros_like(w)
+            xp.zeros_like(w)
             for w in self.weights
         ]
 
         self.bias_m = [
-            np.zeros_like(b)
+            xp.zeros_like(b)
             for b in self.biases
         ]
 
         self.bias_v = [
-            np.zeros_like(b)
+            xp.zeros_like(b)
             for b in self.biases
         ]
 
-    def forward(self, inputs: np.ndarray):
+    def forward(self, inputs):
         self.activations[0] = inputs
 
         # Calculate value of each node (for hidden layer)
@@ -128,9 +134,9 @@ class NeuralNetwork():
     def backprop(self, prediction, target):
         self.training_step += 1
 
-        np.clip(prediction, 1e-15, 1.0, out=prediction)
+        xp.clip(prediction, 1e-15, 1.0, out=prediction)
 
-        loss = -np.mean(np.sum(target * np.log(prediction), axis=1))
+        loss = -xp.mean(xp.sum(target * xp.log(prediction), axis=1))
 
         # Compute deltas (same order as weights)
         delta = [None] * len(self.weights)
@@ -159,7 +165,7 @@ class NeuralNetwork():
             batch_size = d.shape[0]
 
             gradient = self.activations[l].T @ d / batch_size
-            bias_gradient = np.sum(d, axis=0) / batch_size
+            bias_gradient = xp.sum(d, axis=0) / batch_size
 
             # Adam
             self.weight_m[l] = (
@@ -188,7 +194,7 @@ class NeuralNetwork():
             bias_m_hat = self.bias_m[l] / bias_correction1
             bias_v_hat = self.bias_v[l] / bias_correction2
 
-            denom = np.sqrt(v_hat)
+            denom = xp.sqrt(v_hat)
             denom += eps
 
             # AdamW
@@ -214,7 +220,7 @@ class NeuralNetwork():
         self.learning_rate = (
             min_lr
             + (self.initial_lr - min_lr)
-            * (1 + np.cos(np.pi * epoch / total_epochs))
+            * (1 + math.cos(math.pi * epoch / total_epochs))
             / 2
         )
 
@@ -228,19 +234,19 @@ class NeuralNetwork():
 
             # Avoid log(0)
             prediction = pred.copy()
-            np.clip(prediction, 1e-15, 1.0, out=prediction)
+            xp.clip(prediction, 1e-15, 1.0, out=prediction)
 
-            loss = -np.mean(np.sum(y_batch * np.log(prediction), axis=1))
+            loss = -xp.mean(xp.sum(y_batch * xp.log(prediction), axis=1))
             total_loss += loss
 
-            pred_class = np.argmax(pred, axis=1)
-            true_class = np.argmax(y_batch, axis=1)
+            pred_class = xp.argmax(pred, axis=1)
+            true_class = xp.argmax(y_batch, axis=1)
 
-            correct += np.sum(pred_class == true_class)
+            correct += xp.sum(pred_class == true_class)
             total += len(x_batch)
 
-        return total_loss / len(loader), correct / total
-
+        return float(total_loss / len(loader)), float(correct / total)
+    
     def train(self, loader, epochs):
         for epoch in range(epochs + 1):
             total_loss = 0
@@ -262,19 +268,21 @@ class NeuralNetwork():
                     f"Loss={total_loss/len(loader):.4f}\n"
                 )
 
-    def save(self, path: str ="model.npz"):
-        if path[-4:] != ".npz":
+    def save(self, path: str = "model.npz"):
+        if not path.endswith(".npz"):
             path += ".npz"
 
         np.savez(
             path,
-            weights=np.array(self.weights, dtype=object),
-            biases=np.array(self.biases, dtype=object),
 
-            weights_m=np.array(self.weight_m, dtype=object),
-            weights_v=np.array(self.weight_v, dtype=object),
-            biases_m=np.array(self.bias_m, dtype=object),
-            biases_v=np.array(self.bias_v, dtype=object),
+            weights=np.array([xp.asnumpy(w) for w in self.weights], dtype=object),
+            biases=np.array([xp.asnumpy(b) for b in self.biases], dtype=object),
+
+            weights_m=np.array([xp.asnumpy(m) for m in self.weight_m], dtype=object),
+            weights_v=np.array([xp.asnumpy(v) for v in self.weight_v], dtype=object),
+
+            biases_m=np.array([xp.asnumpy(m) for m in self.bias_m], dtype=object),
+            biases_v=np.array([xp.asnumpy(v) for v in self.bias_v], dtype=object),
 
             hyperparameter=np.array([
                 self.learning_rate,
@@ -297,14 +305,14 @@ class NeuralNetwork():
 
         data = np.load(path, allow_pickle=True)
 
-        self.weights = list(data["weights"])
-        self.biases = list(data["biases"])
+        self.weights = [xp.asarray(w) for w in data["weights"]]
+        self.biases = [xp.asarray(b) for b in data["biases"]]
 
-        self.weight_m = list(data["weights_m"])
-        self.weight_v = list(data["weights_v"])
+        self.weight_m = [xp.asarray(m) for m in data["weights_m"]]
+        self.weight_v = [xp.asarray(v) for v in data["weights_v"]]
 
-        self.bias_m = list(data["biases_m"])
-        self.bias_v = list(data["biases_v"])
+        self.bias_m = [xp.asarray(m) for m in data["biases_m"]]
+        self.bias_v = [xp.asarray(v) for v in data["biases_v"]]
 
         (
             self.learning_rate,
@@ -313,8 +321,16 @@ class NeuralNetwork():
             self.beta2,
             self.eps,
             self.weight_decay,
-            self.batch_size
+            self.batch_size,
         ) = data["hyperparameter"]
+
+        self.learning_rate = float(self.learning_rate)
+        self.initial_lr = float(self.initial_lr)
+        self.beta1 = float(self.beta1)
+        self.beta2 = float(self.beta2)
+        self.eps = float(self.eps)
+        self.weight_decay = float(self.weight_decay)
+        self.batch_size = int(self.batch_size)
 
         self.training_step = int(data["training_step"])
         self.beta1_pow = float(data["beta1_pow"])
@@ -347,13 +363,13 @@ if __name__ == "__main__":
     X = emnist.data.astype(np.float32) / 255.0
     Y = emnist.target.astype(np.int32)
 
-    X_train, X_test, Y_train, Y_test = train_test_split(
-        X,
-        Y,
-        test_size=0.2,
-        random_state=42,
-        stratify=Y
-    )
+    X_train, X_test, Y_train, Y_test = train_test_split(X, Y,
+                                                        test_size=0.2,
+                                                        random_state=42,
+                                                        stratify=Y)
+
+    X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
+    Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
 
     train_loader = DataLoader(
         X_train,
@@ -377,9 +393,15 @@ if __name__ == "__main__":
         BATCH_SIZE, LEARNING_RATE,
         BETA1, BETA2, EPS, WEIGHT_DECAY)
 
+    xp.cuda.Stream.null.synchronize()
+
     t2 = time.perf_counter()
+
     nn.train(train_loader, 50)
-    print(f"\nTime taken: {time.perf_counter() - t2:.6f}s")
+
+    xp.cuda.Stream.null.synchronize()
+
+    print(time.perf_counter() - t2)
 
     nn.save("emnist1.npz")
 
