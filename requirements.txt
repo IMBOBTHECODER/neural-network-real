@@ -1,4 +1,3 @@
 numpy
 scikit-learn
 cupy-cuda12x
-cupy-cuda11x

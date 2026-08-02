@@ -37,6 +37,77 @@ class DataLoader:
     def __len__(self):
         return (len(self.X) + self.batch_size - 1) // self.batch_size
 
+class ConvLayer():
+    def __init__():
+        pass
+
+    def forward(self, inputs, kernel):
+        # sample only, no batch
+        kernel_size = kernel.shape[0]
+
+        y = inputs.shape[0] - kernel_size + 1
+        x = inputs.shape[1] - kernel_size + 1
+
+        output = np.zeros((y, x))
+        for i in range(y):
+            for j in range(x):
+                patch = inputs[i:i+kernel_size, j:j+kernel_size]
+                output[i][j] = np.sum(patch * kernel)
+
+        return output
+
+    def forward_multi(self, inputs, kernel):
+        in_channels = inputs.shape[0]
+        output = 0
+        for c in range(in_channels):
+            result = self.forward(inputs[c], kernel[c])  # reuse your working single-channel version
+            output += result
+        return output
+
+    def forward_layer(self, inputs, kernels):
+        # inputs: (in_channels, H, W)
+        # kernels: (out_channels, in_channels, kH, kW)
+        out_channels = kernels.shape[0]
+        outputs = []
+        for k in range(out_channels):
+            result = self.forward_multi(inputs, kernels[k])  # reuse Step 1
+            outputs.append(result)
+        return np.array(outputs)  # shape: (out_channels, H_out, W_out)
+
+
+class PoolLayer():
+    def __init__():
+        pass
+
+    def forward(self, inputs, pool_size, stride):
+        # Max Pooling
+        y = (inputs.shape[0] - pool_size) // stride + 1
+        x = (inputs.shape[1] - pool_size) // stride + 1
+
+        output = np.zeros((y, x))
+
+        stride_i = 0
+        for i in range(y):
+            stride_j = 0
+            for j in range(x):
+                patch = inputs[stride_i:stride_i+pool_size, stride_j:stride_j+pool_size]
+                output[i][j] = np.max(patch)
+
+                stride_j += stride
+            stride_i += stride
+
+        return output
+
+    def forward_multi(self, inputs, pool_size, stride):
+        # inputs: (channels, H, W)
+        channels = inputs.shape[0]
+        outputs = []
+        for c in range(channels):
+            result = self.forward(inputs[c], pool_size, stride)
+            outputs.append(result)
+        return np.array(outputs)  # shape: (channels, H_out, W_out)
+
+
 class NeuralNetwork():
     def __init__(self, input_node: int, hidden_layer: list[int], output_node: int,
                  batch_size: int = 64, learning_rate: float = 1e-3,
@@ -65,7 +136,7 @@ class NeuralNetwork():
         self.weights = [
             (
                 xp.random.randn(self.layers[i], self.layers[i + 1]).astype(xp.float32)
-                * xp.float32(xp.sqrt(2.0 / self.layers[i]))
+                * xp.float32(math.sqrt(2.0 / self.layers[i]))
             )
             for i in range(self.size - 1)
         ]
@@ -197,6 +268,9 @@ class NeuralNetwork():
             denom = xp.sqrt(v_hat)
             denom += eps
 
+            bias_denom = xp.sqrt(bias_v_hat)
+            bias_denom += eps
+
             # AdamW
             self.weights[l] *= (1 - lr * wd)
 
@@ -209,7 +283,7 @@ class NeuralNetwork():
             self.biases[l] -= (
                 lr
                 * bias_m_hat
-                / denom
+                / bias_denom
             )
 
         return loss
@@ -336,6 +410,8 @@ class NeuralNetwork():
         self.beta1_pow = float(data["beta1_pow"])
         self.beta2_pow = float(data["beta2_pow"])
 
+class CNN():
+    pass
 
 if __name__ == "__main__":
     # Setup and training
@@ -346,12 +422,12 @@ if __name__ == "__main__":
     OUTPUT_NODE = 47
 
     LEARNING_RATE = 1e-3
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
 
     BETA1 = 0.9 # ratio between past and
     BETA2 = 0.999
     EPS = 1e-8
-    WEIGHT_DECAY = 1e-4
+    WEIGHT_DECAY = 1e-3
 
     t0 = time.perf_counter()
     emnist = fetch_openml(
@@ -401,7 +477,7 @@ if __name__ == "__main__":
 
     xp.cuda.Stream.null.synchronize()
 
-    print(time.perf_counter() - t2)
+    print(f"Time taken: {time.perf_counter() - t2}s")
 
     nn.save("emnist1.npz")
 
