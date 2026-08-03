@@ -2,4 +2,4 @@ numpy
 scikit-learn
 cupy-cuda12x
 numba
-emnist
+pandas

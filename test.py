@@ -3,13 +3,26 @@
 import numpy as np
 try:
     import cupy as xp
+    GPU = True
 except ImportError:
     import numpy as xp
+    GPU = False
+
+if GPU:
+    compile_fn = xp.fuse()
+else:
+    try:
+        from numba import njit
+        compile_fn = njit
+        NUMBA_AVAILABLE = True
+    except ImportError:
+        compile_fn = lambda f: f  # no-op decorator, just returns the plain function unchanged
+        NUMBA_AVAILABLE = False
 
 import time
+import pandas as pd
 import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
-from emnist import extract_training_samples, extract_test_samples
 from dataclasses import dataclass, field
 
 
@@ -37,7 +50,7 @@ class Config:
     dropout_rate: float = 0.25
 
     # Training
-    batch_size: int = 128
+    batch_size: int = 256
     epochs: int = 50
 
 
@@ -66,6 +79,23 @@ class DataLoader:
 
     def __len__(self):
         return (len(self.X) + self.batch_size - 1) // self.batch_size
+
+
+# Fused Functions
+
+@compile_fn
+def _bn_normalize(x, mean, var, gamma, beta, eps):
+    return gamma * (x - mean) / xp.sqrt(var + eps) + beta
+
+@compile_fn
+def _adam_step(param, m, v, grad, lr, beta1, beta2, bc1, bc2, eps, wd):
+    m_new = beta1 * m + (1 - beta1) * grad
+    v_new = beta2 * v + (1 - beta2) * grad * grad
+    m_hat = m_new / bc1
+    v_hat = v_new / bc2
+    denom = xp.sqrt(v_hat) + eps
+    param_new = param * (1 - lr * wd) - lr * m_hat / denom
+    return param_new, m_new, v_new
 
 
 class ConvLayer():
@@ -248,53 +278,19 @@ class ConvLayer():
         return d_x
 
     def _adam_update(self, d_kernels, d_bias):
-        lr = self.learning_rate
-        eps = self.eps
-        wd = self.weight_decay
-        beta1 = self.beta1
-        beta2 = self.beta2
+        self.beta1_pow *= self.beta1
+        self.beta2_pow *= self.beta2
+        bc1 = 1 - self.beta1_pow
+        bc2 = 1 - self.beta2_pow
 
-        self.beta1_pow *= beta1
-        self.beta2_pow *= beta2
-
-        bias_correction1 = 1 - self.beta1_pow
-        bias_correction2 = 1 - self.beta2_pow
-
-        # Adam
-        self.kernel_m = (
-            beta1 * self.kernel_m
-            + (1 - beta1) * d_kernels
+        self.kernels, self.kernel_m, self.kernel_v = _adam_step(
+            self.kernels, self.kernel_m, self.kernel_v, d_kernels,
+            self.learning_rate, self.beta1, self.beta2, bc1, bc2, self.eps, self.weight_decay
         )
-
-        self.kernel_v = (
-            beta2 * self.kernel_v
-            + (1 - beta2) * d_kernels * d_kernels
+        self.bias, self.bias_m, self.bias_v = _adam_step(
+            self.bias, self.bias_m, self.bias_v, d_bias,
+            self.learning_rate, self.beta1, self.beta2, bc1, bc2, self.eps, 0.0   # no decay on bias
         )
-
-        self.bias_m = beta1 * self.bias_m + (1 - beta1) * d_bias
-        self.bias_v = beta2 * self.bias_v + (1 - beta2) * d_bias * d_bias
-
-        m_hat = self.kernel_m / bias_correction1
-        v_hat = self.kernel_v / bias_correction2
-
-        bias_m_hat = self.bias_m / bias_correction1
-        bias_v_hat = self.bias_v / bias_correction2
-
-        denom = xp.sqrt(v_hat)
-        denom += eps
-
-        bias_denom = xp.sqrt(bias_v_hat) + eps
-
-        # AdamW
-        self.kernels *= (1 - lr * wd)
-
-        self.kernels -= (
-            lr
-            * m_hat
-            / denom
-        )
-
-        self.bias -= lr * bias_m_hat / bias_denom
 
     def update_lr(self, epoch, total_epochs):
         min_lr = 1e-5
@@ -403,21 +399,27 @@ class BatchNormLayer():
         self.weight_decay = 0.0
 
     def forward(self, x):
-        self.x = x   # cache the raw input
+        self.x = x
 
         if self.training:
-            self.mean = xp.mean(x, axis=(0, 2, 3), keepdims=True)   # batch mean, per channel
-            self.var = xp.var(x, axis=(0, 2, 3), keepdims=True)     # batch variance, per channel
+            self.mean = xp.mean(x, axis=(0, 2, 3), keepdims=True)   # reduction — NOT fusable
+            self.var = xp.var(x, axis=(0, 2, 3), keepdims=True)     # reduction — NOT fusable
 
-            # update running stats using this batch's mean/var
             self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * self.mean.reshape(-1)
             self.running_var = self.momentum * self.running_var + (1 - self.momentum) * self.var.reshape(-1)
         else:
             self.mean = self.running_mean.reshape(1, -1, 1, 1)
             self.var = self.running_var.reshape(1, -1, 1, 1)
 
+        gamma_r = self.gamma.reshape(1, -1, 1, 1)
+        beta_r = self.beta.reshape(1, -1, 1, 1)
+
+        # elementwise chain: fused
+        out = _bn_normalize(x, self.mean, self.var, gamma_r, beta_r, self.eps)
+
+        # cache x_norm separately for backward (small extra cost, but backward needs it)
         self.x_norm = (x - self.mean) / xp.sqrt(self.var + self.eps)
-        out = self.gamma.reshape(1, -1, 1, 1) * self.x_norm + self.beta.reshape(1, -1, 1, 1)
+
         return out
 
     def backward(self, d_out):
@@ -451,53 +453,18 @@ class BatchNormLayer():
         return d_x
 
     def _adam_update(self, d_gamma, d_beta):
-        lr = self.learning_rate
-        eps = self.eps
-        wd = self.weight_decay
-        beta1 = self.beta1
-        beta2 = self.beta2
+        self.beta1_pow *= self.beta1
+        self.beta2_pow *= self.beta2
+        bc1 = 1 - self.beta1_pow
+        bc2 = 1 - self.beta2_pow
 
-        self.beta1_pow *= beta1
-        self.beta2_pow *= beta2
-
-        bias_correction1 = 1 - self.beta1_pow
-        bias_correction2 = 1 - self.beta2_pow
-
-        # Adam
-        self.gamma_m = (
-            beta1 * self.gamma_m
-            + (1 - beta1) * d_gamma
+        self.gamma, self.gamma_m, self.gamma_v = _adam_step(
+            self.gamma, self.gamma_m, self.gamma_v, d_gamma,
+            self.learning_rate, self.beta1, self.beta2, bc1, bc2, self.eps, 0.0
         )
-
-        self.gamma_v = (
-            beta2 * self.gamma_v
-            + (1 - beta2) * d_gamma * d_gamma
-        )
-
-        self.beta_m = beta1 * self.beta_m + (1 - beta1) * d_beta
-        self.beta_v = beta2 * self.beta_v + (1 - beta2) * d_beta * d_beta
-
-        m_hat = self.gamma_m / bias_correction1
-        v_hat = self.gamma_v / bias_correction2
-
-        beta_m_hat = self.beta_m / bias_correction1
-        beta_v_hat = self.beta_v / bias_correction2
-
-        denom = xp.sqrt(v_hat) + eps
-
-        beta_denom = xp.sqrt(beta_v_hat) + eps
-
-        # Adam
-        self.gamma -= (
-            lr
-            * m_hat
-            / denom
-        )
-
-        self.beta -= (
-            lr
-            * beta_m_hat
-            / beta_denom
+        self.beta, self.beta_m, self.beta_v = _adam_step(
+            self.beta, self.beta_m, self.beta_v, d_beta,
+            self.learning_rate, self.beta1, self.beta2, bc1, bc2, self.eps, 0.0
         )
 
     def update_lr(self, epoch, total_epochs):
@@ -648,52 +615,13 @@ class NeuralNetwork():
             gradient = self.activations[l].T @ d / batch_size
             bias_gradient = xp.sum(d, axis=0) / batch_size
 
-            # Adam
-            self.weight_m[l] = (
-                beta1 * self.weight_m[l]
-                + (1 - beta1) * gradient
+            self.weights[l], self.weight_m[l], self.weight_v[l] = _adam_step(
+                self.weights[l], self.weight_m[l], self.weight_v[l], gradient,
+                lr, beta1, beta2, bias_correction1, bias_correction2, eps, wd
             )
-
-            self.bias_m[l] = (
-                beta1 * self.bias_m[l]
-                + (1 - beta1) * bias_gradient
-            )
-
-            self.weight_v[l] = (
-                beta2 * self.weight_v[l]
-                + (1 - beta2) * gradient * gradient
-            )
-
-            self.bias_v[l] = (
-                beta2 * self.bias_v[l]
-                + (1 - beta2) * bias_gradient * bias_gradient
-            )
-
-            m_hat = self.weight_m[l] / bias_correction1
-            v_hat = self.weight_v[l] / bias_correction2
-
-            bias_m_hat = self.bias_m[l] / bias_correction1
-            bias_v_hat = self.bias_v[l] / bias_correction2
-
-            denom = xp.sqrt(v_hat)
-            denom += eps
-
-            bias_denom = xp.sqrt(bias_v_hat)
-            bias_denom += eps
-
-            # AdamW
-            self.weights[l] *= (1 - lr * wd)
-
-            self.weights[l] -= (
-                lr
-                * m_hat
-                / denom
-            )
-
-            self.biases[l] -= (
-                lr
-                * bias_m_hat
-                / bias_denom
+            self.biases[l], self.bias_m[l], self.bias_v[l] = _adam_step(
+                self.biases[l], self.bias_m[l], self.bias_v[l], bias_gradient,
+                lr, beta1, beta2, bias_correction1, bias_correction2, eps, 0.0
             )
 
         if compute_final_gradient:
@@ -990,13 +918,14 @@ if __name__ == "__main__":
     ]
 
     t0 = time.perf_counter()
-    X_train, Y_train = extract_training_samples('bymerge')
-    X_test, Y_test = extract_test_samples('bymerge')
+    train_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv', header=None)
+    test_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv', header=None)
 
-    X_train = X_train.astype(np.float32).reshape(-1, 784) / 255.0
-    X_test = X_test.astype(np.float32).reshape(-1, 784) / 255.0
-    Y_train = Y_train.astype(np.int32)
-    Y_test = Y_test.astype(np.int32)
+    Y_train = train_df.iloc[:, 0].to_numpy().astype(np.int32)
+    X_train = train_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
+
+    Y_test = test_df.iloc[:, 0].to_numpy().astype(np.int32)
+    X_test = test_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
 
     X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
     Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
