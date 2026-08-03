@@ -25,7 +25,7 @@ class Config:
 
     # MLP architecture
     input_node: int = 784
-    hidden_layer: list = field(default_factory=lambda: [256, 128])
+    hidden_layer: list = field(default_factory=lambda: [256])
     output_node: int = 47
 
     # Optimizer constants
@@ -34,10 +34,11 @@ class Config:
     beta2: float = 0.999
     eps: float = 1e-8
     weight_decay: float = 1e-3
+    dropout_rate: float = 0.25
 
     # Training
     batch_size: int = 128
-    epochs: int = 5
+    epochs: int = 50
 
 
 class DataLoader:
@@ -68,28 +69,34 @@ class DataLoader:
 
 
 class ConvLayer():
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
         self.kernels = xp.random.randn(
             out_channels, in_channels, kernel_size, kernel_size
         ).astype(xp.float32) * xp.float32(math.sqrt(2.0 / (in_channels * kernel_size * kernel_size)))
 
+        self.bias = xp.zeros(out_channels, dtype=xp.float32)   # one per output channel
+
         self.stride = stride
+        self.padding = padding
 
         # Adam state (per-layer, independent buffers)
         self.kernel_m = xp.zeros_like(self.kernels)
         self.kernel_v = xp.zeros_like(self.kernels)
+        self.bias_m = xp.zeros_like(self.bias)
+        self.bias_v = xp.zeros_like(self.bias)
+
         self.beta1_pow = 1.0
         self.beta2_pow = 1.0
 
         # Hyperparameter values injected by CNN.__init__, but give safe defaults
         self.learning_rate = 1e-3
-        self.initial_lr = config.learning_rate
+        self.initial_lr = self.learning_rate
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.eps = 1e-8
         self.weight_decay = 1e-3
 
-    def _im2col(self, x, kH, kW, stride=1):
+    def _im2col(self, x, kH, kW, stride=1, padding=0):
         # Rearranges every sliding-window patch into a layout ready to become
         # matrix rows, so convolution can be done as one matmul instead of loops.
         #
@@ -98,9 +105,18 @@ class ConvLayer():
 
         N, C, H, W = x.shape
 
+        if padding > 0:
+            x = xp.pad(
+                x,
+                ((0, 0), (0, 0), (padding, padding), (padding, padding)),
+                mode="constant",
+            )
+
+        H_pad, W_pad = x.shape[2], x.shape[3]        # use PADDED dims from here on
+
         # Output spatial size — how many positions the kernel stops at
-        H_out = (H - kH) // stride + 1
-        W_out = (W - kW) // stride + 1
+        H_out = (H_pad - kH) // stride + 1
+        W_out = (W_pad - kW) // stride + 1
 
         # 6D holder. Think of it as: for each position (i, j) inside the kernel
         # window, store the value that kernel-cell lands on, for every output
@@ -125,12 +141,16 @@ class ConvLayer():
 
     def _col2im(self, d_col, N, C, kH, kW, H, W):
         stride = self.stride
+        padding = self.padding
 
-        H_out = (H - kH) // stride + 1
-        W_out = (W - kW) // stride + 1
+        H_pad = H + 2 * padding
+        W_pad = W + 2 * padding
+
+        H_out = (H_pad - kH) // stride + 1
+        W_out = (W_pad - kW) // stride + 1
 
         d_col = d_col.reshape(N, H_out, W_out, C, kH, kW).transpose(0, 3, 4, 5, 1, 2)
-        d_x = xp.zeros((N, C, H, W), dtype=d_col.dtype)
+        d_x = xp.zeros((N, C, H_pad, W_pad), dtype=d_col.dtype)
 
         for i in range(kH):
             i_end = i + stride * H_out
@@ -138,6 +158,8 @@ class ConvLayer():
                 j_end = j + stride * W_out
                 d_x[:, :, i:i_end:stride, j:j_end:stride] += d_col[:, :, i, j, :, :]
 
+        if padding > 0:
+            d_x = d_x[:, :, padding:-padding, padding:-padding]
         return d_x
 
 
@@ -154,7 +176,7 @@ class ConvLayer():
         kH, kW = self.kernels.shape[2], self.kernels.shape[3]
 
         # Step 1: gather all patches (still in 6D "per kernel-cell" layout)
-        col, self.H_out, self.W_out = self._im2col(x, kH, kW, self.stride)
+        col, self.H_out, self.W_out = self._im2col(x, kH, kW, self.stride, self.padding)
 
         # Step 2: reshape into a 2D matrix where each ROW is one flattened patch.
         #
@@ -178,6 +200,8 @@ class ConvLayer():
         # We built rows as (N, H_out, W_out), so unflatten to that, put C_out last,
         # then transpose to channels-first (NCHW) to match the rest of the pipeline.
         out = out.reshape(N, self.H_out, self.W_out, C_out).transpose(0, 3, 1, 2)
+
+        out = out + self.bias.reshape(1, C_out, 1, 1)      # bias broadcasts across N, H_out, W_out
 
         return out
 
@@ -203,6 +227,8 @@ class ConvLayer():
         d_w_col = self.col.T @ d_out_flat               # (C*kH*kW, C_out)
         d_kernels = d_w_col.T.reshape(C_out, C, kH, kW) # shape it back like the kernels
 
+        d_bias = xp.sum(d_out, axis=(0, 2, 3))     # sum over N, H_out, W_out -> shape (C_out,)
+
         # INPUT GRADIENT — "how did each input pixel affect the loss?"
         # Rule: an input's gradient = the kernel it multiplied, times the output gradient.
         # Same idea as the MLP's  delta @ weights.T.
@@ -216,12 +242,12 @@ class ConvLayer():
 
         # Use the kernel gradient to actually update the kernels (Adam does this).
         # Note: this changes self.kernels; it does NOT touch d_x.
-        self._adam_update(d_kernels)
+        self._adam_update(d_kernels, d_bias)
 
         # Hand the input gradient back so the previous layer can keep going.
         return d_x
 
-    def _adam_update(self, d_kernels):
+    def _adam_update(self, d_kernels, d_bias):
         lr = self.learning_rate
         eps = self.eps
         wd = self.weight_decay
@@ -245,11 +271,19 @@ class ConvLayer():
             + (1 - beta2) * d_kernels * d_kernels
         )
 
+        self.bias_m = beta1 * self.bias_m + (1 - beta1) * d_bias
+        self.bias_v = beta2 * self.bias_v + (1 - beta2) * d_bias * d_bias
+
         m_hat = self.kernel_m / bias_correction1
         v_hat = self.kernel_v / bias_correction2
 
+        bias_m_hat = self.bias_m / bias_correction1
+        bias_v_hat = self.bias_v / bias_correction2
+
         denom = xp.sqrt(v_hat)
         denom += eps
+
+        bias_denom = xp.sqrt(bias_v_hat) + eps
 
         # AdamW
         self.kernels *= (1 - lr * wd)
@@ -259,6 +293,8 @@ class ConvLayer():
             * m_hat
             / denom
         )
+
+        self.bias -= lr * bias_m_hat / bias_denom
 
     def update_lr(self, epoch, total_epochs):
         min_lr = 1e-5
@@ -271,86 +307,57 @@ class ConvLayer():
 
 
 class PoolLayer():
-    def __init__(self, pool_size, stride, training):
+    def __init__(self, pool_size, stride, training=False):
         self.training = training
         self.pool_size = pool_size
         self.stride = stride
 
-    def _pool_single(self, inputs, pool_size, stride):
-        y = (inputs.shape[0] - pool_size) // stride + 1
-        x = (inputs.shape[1] - pool_size) // stride + 1
-
-        output = xp.zeros((y, x), dtype=xp.float32)
-
-        mask = None
-        if self.training:                      # only build mask when we'll need it
-            mask = xp.zeros_like(inputs)
-
-        stride_i = 0
-        for i in range(y):
-            stride_j = 0
-            for j in range(x):
-                patch = inputs[stride_i:stride_i+pool_size, stride_j:stride_j+pool_size]
-                output[i, j] = xp.max(patch)
-
-                if self.training:
-                    flat = xp.argmax(patch)
-                    pi, pj = divmod(int(flat), pool_size)
-                    mask[stride_i + pi, stride_j + pj] = 1.0
-
-                stride_j += stride
-            stride_i += stride
-
-        return output, mask
-
-    def _pool_multi(self, inputs, pool_size, stride):
-        channels = inputs.shape[0]
-        outputs = []
-        masks = []
-        for c in range(channels):
-            result, mask = self._pool_single(inputs[c], pool_size, stride)
-            outputs.append(result)
-            masks.append(mask)
-        return xp.array(outputs), xp.array(masks)
-
     def forward(self, x):
-        # x: (batch, channels, H, W), uses self.pool_size, self.stride
-        batch_size = x.shape[0]
-        outputs = []
-        masks = []
-        for b in range(batch_size):
-            result, mask = self._pool_multi(x[b], self.pool_size, self.stride)
-            outputs.append(result)
-            masks.append(mask)
+        self.in_shape = x.shape
 
-        self.mask = xp.array(masks)      # (batch, channels, H, W) — same shape as input x
-        return xp.array(outputs)         # (batch, channels, H_out, W_out)
+        N, C, H, W = self.in_shape
+        ps = self.pool_size
+
+        # Crop the leftover edge so dimensions divide evenly by pool_size.
+        # This matches the loop version, which ignored the unfillable row/col.
+        H_crop = (H // ps) * ps      # 11 -> 10
+        W_crop = (W // ps) * ps      # 11 -> 10
+        x = x[:, :, :H_crop, :W_crop]
+
+        H_out = H_crop // ps
+        W_out = W_crop // ps
+
+        x_reshaped = x.reshape(N, C, H_out, ps, W_out, ps)
+        out = x_reshaped.max(axis=(3, 5))
+
+        if self.training:
+            max_expanded = out[:, :, :, None, :, None]
+            self.mask = (x_reshaped == max_expanded).reshape(N, C, H_crop, W_crop).astype(xp.float32)
+
+        return out
     
     def backward(self, grad):
-        # grad: (batch, channels, out_height, out_width) — one gradient per pooling window
-        # self.mask: (batch, channels, in_height, in_width) — 1.0 at each window's max position
-        d_input = xp.zeros_like(self.mask)   # input-shaped, gradient w.r.t. this layer's input
+        # grad: (N, C, H_out, W_out) — one gradient per pooling window
+        # self.mask: (N, C, H_crop, W_crop) — 1.0 at each window's max position
+        N, C, H_out, W_out = grad.shape
+        ps = self.pool_size
 
-        batch_size, num_channels, out_height, out_width = grad.shape
-        pool_size = self.pool_size
-        stride = self.stride
+        # Upsample grad: each output cell's gradient spread across its ps×ps window.
+        # Insert size-1 axes where the within-window dims go, then broadcast.
+        # (N, C, H_out, W_out) -> (N, C, H_out, 1, W_out, 1) -> repeat to (N, C, H_out, ps, W_out, ps)
+        grad_up = grad[:, :, :, None, :, None]                       # (N, C, H_out, 1, W_out, 1)
+        grad_up = xp.broadcast_to(grad_up, (N, C, H_out, ps, W_out, ps))
+        grad_up = grad_up.reshape(N, C, H_out * ps, W_out * ps)      # (N, C, H_crop, W_crop)
 
-        for image in range(batch_size):
-            for channel in range(num_channels):
-                for out_row in range(out_height):
-                    for out_col in range(out_width):
-                        row_start = out_row * stride
-                        col_start = out_col * stride
+        # Keep gradient only at the max positions (mask is 1 there, 0 elsewhere).
+        d_input = grad_up * self.mask                                # (N, C, H_crop, W_crop)
 
-                        window = (
-                            slice(row_start, row_start + pool_size),
-                            slice(col_start, col_start + pool_size),
-                        )
-
-                        d_input[image, channel][window] += (
-                            grad[image, channel, out_row, out_col]
-                            * self.mask[image, channel][window]
-                        )
+        # Reverse-pad back to the original pre-crop size (dropped edge gets zero grad).
+        N_, C_, H_orig, W_orig = self.in_shape
+        if d_input.shape[2] != H_orig or d_input.shape[3] != W_orig:
+            full = xp.zeros((N_, C_, H_orig, W_orig), dtype=d_input.dtype)
+            full[:, :, :d_input.shape[2], :d_input.shape[3]] = d_input
+            d_input = full
 
         return d_input
 
@@ -366,8 +373,11 @@ class ActivationLayer():
 
 class NeuralNetwork():
     def __init__(self, input_node: int, hidden_layer: list[int], output_node: int,
-                 batch_size: int = 64, learning_rate: float = 1e-3,
-                 beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8, weight_decay: float = 1e-4):
+                batch_size: int = 64, learning_rate: float = 1e-3,
+                beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8, weight_decay: float = 1e-4, dropout_rate = 0.0):
+        self.layers = [input_node,*hidden_layer, output_node]
+        self.size = len(self.layers)
+
         self.training_step = 0
         self.batch_size = batch_size
 
@@ -379,15 +389,16 @@ class NeuralNetwork():
         self.beta2 = beta2
         self.weight_decay = weight_decay
 
+        self.dropout_rate = dropout_rate
+        self.training = True
+        self.dropout_masks = [None] * (self.size - 1)
+
         # Bias Correction
         self.beta1_pow = 1.0
         self.beta2_pow = 1.0
 
         # Can be switched to Xavier when using Sigmoid, Tanh, etc
         # He initiallisation
-
-        self.layers = [input_node,*hidden_layer, output_node]
-        self.size = len(self.layers)
 
         self.weights = [
             (
@@ -403,17 +414,11 @@ class NeuralNetwork():
             for i in range(self.size - 1)
         ]
 
-        # Value after activation
-        self.activations = [
-            xp.empty((batch_size, size), dtype=xp.float32)
-            for size in self.layers
-        ]
+        # Value after activation (filled per forward pass; rebound, not reused)
+        self.activations = [None] * self.size
 
-        # Value before activation
-        self.logits = [
-            xp.empty((batch_size, size), dtype=xp.float32)
-            for size in self.layers[1:]
-        ]
+        # Value before activation (filled per forward pass; rebound, not reused)
+        self.logits = [None] * (self.size - 1)
 
         # Adam's momentum and variance
         self.weight_m = [
@@ -439,23 +444,27 @@ class NeuralNetwork():
     def forward(self, inputs):
         self.activations[0] = inputs
 
-        # Calculate value of each node (for hidden layer)
-        for layer in range(1, self.size - 1):
+        for layer in range(1, self.size - 1):     # hidden layers only
             l = layer - 1
-
             x = self.activations[l]
             z = x @ self.weights[l] + self.biases[l]
-
-            self.activations[layer] = LeakyReLU(z)
             self.logits[l] = z
 
-        # Calculate value of each node (for final/output layer)
+            a = LeakyReLU(z)
+
+            # dropout after activation, training only
+            if self.training and self.dropout_rate > 0:
+                mask = (xp.random.rand(*a.shape) > self.dropout_rate).astype(xp.float32)
+                a = a * mask / (1 - self.dropout_rate)
+                self.dropout_masks[l] = mask
+
+            self.activations[layer] = a
+
+        # output layer — NO dropout, NO LeakyReLU, just softmax
         x = self.activations[-2]
         z = x @ self.weights[-1] + self.biases[-1]
-
         self.logits[-1] = z
         self.activations[-1] = softmax(z)
-
         return self.activations[-1]
 
     def backprop(self, prediction, target, compute_final_gradient = False):
@@ -469,11 +478,13 @@ class NeuralNetwork():
         delta = [None] * len(self.weights)
 
         delta[-1] = prediction - target
-
         for l in range(len(self.weights) - 2, -1, -1):
             delta[l] = (
                 delta[l + 1] @ self.weights[l + 1].T
             ) * LeakyReLU_derivative(self.logits[l])
+
+            if self.training and self.dropout_rate > 0 and self.dropout_masks[l] is not None:
+                delta[l] = delta[l] * self.dropout_masks[l] / (1 - self.dropout_rate)
 
         final_delta = None
         if compute_final_gradient:
@@ -682,6 +693,7 @@ class CNN():
         for layer in self.layers:
             if isinstance(layer, ConvLayer):
                 layer.learning_rate = config.learning_rate
+                layer.initial_lr = config.learning_rate
                 layer.beta1 = config.beta1
                 layer.beta2 = config.beta2
                 layer.eps = config.eps
@@ -700,6 +712,7 @@ class CNN():
             beta2=config.beta2,
             eps=config.eps,
             weight_decay=config.weight_decay,
+            dropout_rate=config.dropout_rate
         )
 
     def forward(self, x):
@@ -731,6 +744,8 @@ class CNN():
                 layer.update_lr(epoch, total_epochs)
 
     def train(self, loader, epochs):
+        self.set_training(True)
+
         for epoch in range(epochs + 1):
             total_loss = 0
 
@@ -750,17 +765,39 @@ class CNN():
                     f"Loss={total_loss/len(loader):.4f}\n"
                 )
 
+    def evaluate(self, loader):
+        self.set_training(False)
+
+        correct = 0
+        total = 0
+        total_loss = 0
+
+        for x_batch, y_batch in loader:
+            pred = self.forward(x_batch)          # full CNN forward
+            prediction = pred.copy()
+            xp.clip(prediction, 1e-15, 1.0, out=prediction)
+
+            loss = -xp.mean(xp.sum(y_batch * xp.log(prediction), axis=1))
+            total_loss += loss
+
+            correct += xp.sum(xp.argmax(pred, axis=1) == xp.argmax(y_batch, axis=1))
+            total += len(x_batch)
+
+        self.set_training(True)           # restore training mode afterward
+        return float(total_loss / len(loader)), float(correct / total)
+
     def _compute_flatten_size(self, input_shape):
         # input_shape: (channels, H, W) — e.g. (1, 28, 28)
         channels, height, width = input_shape
 
         for layer in self.layers:
             if isinstance(layer, ConvLayer):
-                k = layer.kernels.shape[2]          # kernel size (kH)
+                k = layer.kernels.shape[2]
                 stride = layer.stride
-                height = (height - k) // stride + 1
-                width  = (width  - k) // stride + 1
-                channels = layer.kernels.shape[0]   # out_channels
+                padding = layer.padding
+                height = (height + 2*padding - k) // stride + 1
+                width  = (width  + 2*padding - k) // stride + 1
+                channels = layer.kernels.shape[0]
 
             elif isinstance(layer, PoolLayer):
                 p = layer.pool_size
@@ -773,15 +810,31 @@ class CNN():
 
         return channels * height * width
 
+    def set_training(self, training):
+        self.mlp.training = training
+        for layer in self.layers:
+            if hasattr(layer, "training"):
+                layer.training = training
+
+
 if __name__ == "__main__":
     config = Config()
     config.cnn_layer = [
-        ConvLayer(1, 8, 3),
+        ConvLayer(1, 16, 3, padding=1),
         ActivationLayer(),
-        PoolLayer(2, 2, training=True),
-        ConvLayer(8, 16, 3),
+
+        ConvLayer(16, 16, 3, padding=1),
         ActivationLayer(),
-        PoolLayer(2, 2, training=True),
+
+        PoolLayer(2, 2),
+
+        ConvLayer(16, 32, 3, padding=1),
+        ActivationLayer(),
+
+        ConvLayer(32, 32, 3, padding=1),
+        ActivationLayer(),
+
+        PoolLayer(2, 2),
     ]
 
     t0 = time.perf_counter()
@@ -800,11 +853,6 @@ if __name__ == "__main__":
         random_state=42,
         stratify=Y
     )
-
-    # --- TEMP: tiny subset for a first correctness run ---
-    X_train, Y_train = X_train[:256], Y_train[:256]
-    X_test,  Y_test  = X_test[:128],  Y_test[:128]
-    # -----------------------------------------------------
 
     X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
     Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
@@ -838,7 +886,7 @@ if __name__ == "__main__":
 
     # nn.save("emnist1.npz")
 
-    # loss, acc = nn.evaluate(test_loader)
+    loss, acc = nn.evaluate(test_loader)
 
-    # print(f"Loss: {loss:.4f}")
-    # print(f"Accuracy: {acc:.2%}")
+    print(f"Loss: {loss:.4f}")
+    print(f"Accuracy: {acc:.2%}")
