@@ -9,8 +9,7 @@ except ImportError:
 import time
 import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
-from sklearn.datasets import fetch_openml
-from sklearn.model_selection import train_test_split
+from emnist import extract_training_samples, extract_test_samples
 from dataclasses import dataclass, field
 
 
@@ -25,15 +24,16 @@ class Config:
 
     # MLP architecture
     input_node: int = 784
-    hidden_layer: list = field(default_factory=lambda: [256])
+    hidden_layer: list = field(default_factory=lambda: [128])
     output_node: int = 47
 
     # Optimizer constants
     learning_rate: float = 1e-3
+    initial_lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.999
     eps: float = 1e-8
-    weight_decay: float = 1e-3
+    weight_decay: float = 5e-4
     dropout_rate: float = 0.25
 
     # Training
@@ -90,7 +90,7 @@ class ConvLayer():
 
         # Hyperparameter values injected by CNN.__init__, but give safe defaults
         self.learning_rate = 1e-3
-        self.initial_lr = self.learning_rate
+        self.initial_lr = 1e-4
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.eps = 1e-8
@@ -371,9 +371,148 @@ class ActivationLayer():
         return grad * LeakyReLU_derivative(self.last_input)
 
 
+class BatchNormLayer():
+    def __init__(self, num_channels, momentum, training=False):
+        self.num_channels = num_channels
+        self.momentum = momentum
+        self.training = training
+
+        # learnable parameters
+        self.gamma = xp.ones(num_channels, dtype=xp.float32)
+        self.beta = xp.zeros(num_channels, dtype=xp.float32)
+
+        # Adam state (per-layer, independent buffers)
+        self.gamma_m = xp.zeros_like(self.gamma)
+        self.gamma_v = xp.zeros_like(self.gamma)
+        self.beta_m = xp.zeros_like(self.beta)
+        self.beta_v = xp.zeros_like(self.beta)
+
+        self.beta1_pow = 1.0
+        self.beta2_pow = 1.0
+
+        # non-learned running statistics (eval-time use)
+        self.running_mean = xp.zeros(num_channels, dtype=xp.float32)
+        self.running_var = xp.ones(num_channels, dtype=xp.float32)   # init to 1, not 0
+
+        # Hyperparameter values injected by CNN.__init__, but give safe defaults
+        self.learning_rate = 1e-3
+        self.initial_lr = 1e-4
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.eps = 1e-8
+        self.weight_decay = 0.0
+
+    def forward(self, x):
+        self.x = x   # cache the raw input
+
+        if self.training:
+            self.mean = xp.mean(x, axis=(0, 2, 3), keepdims=True)   # batch mean, per channel
+            self.var = xp.var(x, axis=(0, 2, 3), keepdims=True)     # batch variance, per channel
+
+            # update running stats using this batch's mean/var
+            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * self.mean.reshape(-1)
+            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * self.var.reshape(-1)
+        else:
+            self.mean = self.running_mean.reshape(1, -1, 1, 1)
+            self.var = self.running_var.reshape(1, -1, 1, 1)
+
+        self.x_norm = (x - self.mean) / xp.sqrt(self.var + self.eps)
+        out = self.gamma.reshape(1, -1, 1, 1) * self.x_norm + self.beta.reshape(1, -1, 1, 1)
+        return out
+
+    def backward(self, d_out):
+        # d_out: (N, C, H, W) — gradient w.r.t. this layer's output
+        N, C, H, W = d_out.shape
+        m = N * H * W   # number of elements averaged per channel
+
+        gamma = self.gamma
+        beta = self.beta
+        x_norm = self.x_norm
+
+        d_gamma = xp.sum(d_out * x_norm, axis=(0, 2, 3))
+        d_beta = xp.sum(d_out, axis=(0, 2, 3))
+
+        # x feeds into mean, var, AND x_norm directly — all three paths must be summed.
+        gamma = self.gamma.reshape(1, C, 1, 1)
+        std_inv = 1.0 / xp.sqrt(self.var + self.eps)   # cached from forward, reshaped to broadcast
+
+        d_x_norm = d_out * gamma   # gradient w.r.t. x_norm, undoing the gamma multiply
+
+        d_var = xp.sum(d_x_norm * (self.x - self.mean) * -0.5 * std_inv**3, axis=(0, 2, 3), keepdims=True)
+        d_mean = xp.sum(d_x_norm * -std_inv, axis=(0, 2, 3), keepdims=True) \
+                + d_var * xp.mean(-2.0 * (self.x - self.mean), axis=(0, 2, 3), keepdims=True)
+
+        d_x = (d_x_norm * std_inv) \
+            + (d_var * 2.0 * (self.x - self.mean) / m) \
+            + (d_mean / m)
+
+        self._adam_update(d_gamma, d_beta)
+
+        return d_x
+
+    def _adam_update(self, d_gamma, d_beta):
+        lr = self.learning_rate
+        eps = self.eps
+        wd = self.weight_decay
+        beta1 = self.beta1
+        beta2 = self.beta2
+
+        self.beta1_pow *= beta1
+        self.beta2_pow *= beta2
+
+        bias_correction1 = 1 - self.beta1_pow
+        bias_correction2 = 1 - self.beta2_pow
+
+        # Adam
+        self.gamma_m = (
+            beta1 * self.gamma_m
+            + (1 - beta1) * d_gamma
+        )
+
+        self.gamma_v = (
+            beta2 * self.gamma_v
+            + (1 - beta2) * d_gamma * d_gamma
+        )
+
+        self.beta_m = beta1 * self.beta_m + (1 - beta1) * d_beta
+        self.beta_v = beta2 * self.beta_v + (1 - beta2) * d_beta * d_beta
+
+        m_hat = self.gamma_m / bias_correction1
+        v_hat = self.gamma_v / bias_correction2
+
+        beta_m_hat = self.beta_m / bias_correction1
+        beta_v_hat = self.beta_v / bias_correction2
+
+        denom = xp.sqrt(v_hat) + eps
+
+        beta_denom = xp.sqrt(beta_v_hat) + eps
+
+        # Adam
+        self.gamma -= (
+            lr
+            * m_hat
+            / denom
+        )
+
+        self.beta -= (
+            lr
+            * beta_m_hat
+            / beta_denom
+        )
+
+    def update_lr(self, epoch, total_epochs):
+        min_lr = 1e-5
+        self.learning_rate = (
+            min_lr
+            + (self.initial_lr - min_lr)
+            * (1 + math.cos(math.pi * epoch / total_epochs))
+            / 2
+        )
+
+
 class NeuralNetwork():
     def __init__(self, input_node: int, hidden_layer: list[int], output_node: int,
-                batch_size: int = 64, learning_rate: float = 1e-3,
+                batch_size: int = 64, learning_rate: float = 1e-3, initial_lr: float = 1e-4,
                 beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8, weight_decay: float = 1e-4, dropout_rate = 0.0):
         self.layers = [input_node,*hidden_layer, output_node]
         self.size = len(self.layers)
@@ -382,7 +521,7 @@ class NeuralNetwork():
         self.batch_size = batch_size
 
         self.learning_rate = learning_rate
-        self.initial_lr = learning_rate
+        self.initial_lr = initial_lr
 
         self.eps = eps
         self.beta1 = beta1
@@ -693,11 +832,19 @@ class CNN():
         for layer in self.layers:
             if isinstance(layer, ConvLayer):
                 layer.learning_rate = config.learning_rate
-                layer.initial_lr = config.learning_rate
+                layer.initial_lr = config.initial_lr
                 layer.beta1 = config.beta1
                 layer.beta2 = config.beta2
                 layer.eps = config.eps
                 layer.weight_decay = config.weight_decay
+
+            if isinstance(layer, BatchNormLayer):
+                layer.learning_rate = config.learning_rate
+                layer.initial_lr = config.initial_lr
+                layer.beta1 = config.beta1
+                layer.beta2 = config.beta2
+                layer.eps = config.eps
+                layer.weight_decay = 0.0   # deliberately NOT config.weight_decay
 
         flatten_size = self._compute_flatten_size(config.input_shape)
 
@@ -708,6 +855,7 @@ class CNN():
             output_node=config.output_node,
             batch_size=config.batch_size,
             learning_rate=config.learning_rate,
+            initial_lr=config.initial_lr,
             beta1=config.beta1,
             beta2=config.beta2,
             eps=config.eps,
@@ -806,7 +954,7 @@ class CNN():
                 width  = (width  - p) // stride + 1
                 # channels unchanged for pooling
 
-            # ActivationLayer: no shape change, skip
+            # BatchNormLayer, ActivationLayer: no shape change, skip
 
         return channels * height * width
 
@@ -821,38 +969,34 @@ if __name__ == "__main__":
     config = Config()
     config.cnn_layer = [
         ConvLayer(1, 16, 3, padding=1),
+        BatchNormLayer(16, momentum=0.9),
         ActivationLayer(),
 
         ConvLayer(16, 16, 3, padding=1),
+        BatchNormLayer(16, momentum=0.9),
         ActivationLayer(),
 
         PoolLayer(2, 2),
 
         ConvLayer(16, 32, 3, padding=1),
+        BatchNormLayer(32, momentum=0.9),
         ActivationLayer(),
 
         ConvLayer(32, 32, 3, padding=1),
+        BatchNormLayer(32, momentum=0.9),
         ActivationLayer(),
 
         PoolLayer(2, 2),
     ]
 
     t0 = time.perf_counter()
-    emnist = fetch_openml(
-        "EMNIST_balanced",
-        version=1,
-        as_frame=False
-    )
+    X_train, Y_train = extract_training_samples('bymerge')
+    X_test, Y_test = extract_test_samples('bymerge')
 
-    X = emnist.data.astype(np.float32) / 255.0
-    Y = emnist.target.astype(np.int32)
-
-    X_train, X_test, Y_train, Y_test = train_test_split(
-        X, Y,
-        test_size=0.2,
-        random_state=42,
-        stratify=Y
-    )
+    X_train = X_train.astype(np.float32).reshape(-1, 784) / 255.0
+    X_test = X_test.astype(np.float32).reshape(-1, 784) / 255.0
+    Y_train = Y_train.astype(np.int32)
+    Y_test = Y_test.astype(np.int32)
 
     X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
     Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
