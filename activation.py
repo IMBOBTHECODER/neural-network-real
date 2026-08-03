@@ -1,3 +1,5 @@
+# Copyright (C) 2025  <your name>
+
 import numpy as np
 
 try:
