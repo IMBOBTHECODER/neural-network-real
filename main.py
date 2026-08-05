@@ -1130,30 +1130,32 @@ def load_model(path):
 if __name__ == "__main__":
     config = Config()
     config.cnn_layer = [
-        ConvLayer(3, 16, 3, padding=1),
-        BatchNormLayer(16, momentum=0.9),
-        ActivationLayer(),
-
-        ResidualBlock([
-            ConvLayer(16, 16, 3, padding=1),
-            BatchNormLayer(16, momentum=0.9),
-            ActivationLayer(),
-            ConvLayer(16, 16, 3, padding=1),
-            BatchNormLayer(16, momentum=0.9),
-        ]),
-
-        PoolLayer(2, 2),
-
-        ConvLayer(16, 32, 3, padding=1),   # channel change happens HERE, plainly
+        ConvLayer(3, 32, 3, padding=1),
         BatchNormLayer(32, momentum=0.9),
         ActivationLayer(),
 
         ResidualBlock([
-            ConvLayer(32, 32, 3, padding=1),
-            BatchNormLayer(32, momentum=0.9),
-            ActivationLayer(),
-            ConvLayer(32, 32, 3, padding=1),
-            BatchNormLayer(32, momentum=0.9),
+            ConvLayer(32, 32, 3, padding=1), BatchNormLayer(32, momentum=0.9), ActivationLayer(),
+            ConvLayer(32, 32, 3, padding=1), BatchNormLayer(32, momentum=0.9),
+        ]),
+        ResidualBlock([
+            ConvLayer(32, 32, 3, padding=1), BatchNormLayer(32, momentum=0.9), ActivationLayer(),
+            ConvLayer(32, 32, 3, padding=1), BatchNormLayer(32, momentum=0.9),
+        ]),
+
+        PoolLayer(2, 2),
+
+        ConvLayer(32, 64, 3, padding=1),
+        BatchNormLayer(64, momentum=0.9),
+        ActivationLayer(),
+
+        ResidualBlock([
+            ConvLayer(64, 64, 3, padding=1), BatchNormLayer(64, momentum=0.9), ActivationLayer(),
+            ConvLayer(64, 64, 3, padding=1), BatchNormLayer(64, momentum=0.9),
+        ]),
+        ResidualBlock([
+            ConvLayer(64, 64, 3, padding=1), BatchNormLayer(64, momentum=0.9), ActivationLayer(),
+            ConvLayer(64, 64, 3, padding=1), BatchNormLayer(64, momentum=0.9),
         ]),
 
         PoolLayer(2, 2),
@@ -1202,7 +1204,7 @@ if __name__ == "__main__":
     print("Test:")
     print(f"Loss: {loss:.4f}")
     print(f"Accuracy: {acc:.2%}\n")
-    
+
     print("Train:")
     print(f"Loss: {train_loss:.4f}") 
     print(f"Accuracy: {train_acc:.2%}")
