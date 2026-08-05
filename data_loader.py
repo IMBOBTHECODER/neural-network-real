@@ -9,11 +9,13 @@ except ImportError:
 
 
 class DataLoader:
-    def __init__(self, X, Y, batch_size=64, shuffle=True):
+    def __init__(self, X, Y, batch_size=64, shuffle=True, training=False, image_shape=None):
         self.X = X
         self.Y = Y
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.training = training
+        self.image_shape = image_shape
         self.num_classes = int(xp.max(Y).item()) + 1
         self.Y_onehot = xp.eye(self.num_classes, dtype=xp.float32)[Y]   # computed once
 
@@ -23,10 +25,33 @@ class DataLoader:
             xp.random.shuffle(indices)
         for start in range(0, len(indices), self.batch_size):
             batch = indices[start:start + self.batch_size]
-            yield self.X[batch], self.Y_onehot[batch]   # just slice, no recompute
+
+            x = self.X[batch]   # slice out the raw batch first
+            if self.training:
+                x = augment_batch(x, self.image_shape)   # transform it here
+
+            yield x, self.Y_onehot[batch]  # yield the (possibly augmented) x
 
     def __len__(self):
         return (len(self.X) + self.batch_size - 1) // self.batch_size
+
+def augment_batch(x, image_shape):
+    # x: (N, flat_pixels) -> reshape to (N, C, H, W) for spatial transforms
+    N = x.shape[0]
+    C, H, W = image_shape
+    x = x.reshape(N, C, H, W)
+
+    # 1. Random horizontal flip (skip this for EMNIST characters — only use for CIFAR-10-like data)
+    flip_mask = xp.random.rand(N) < 0.5
+    x[flip_mask] = x[flip_mask, :, :, ::-1]
+
+    # 2. Random small translation (shift up/down/left/right by a few pixels)
+    shift_x = xp.random.randint(-2, 3, size=N)   # e.g. -2 to +2 pixels
+    shift_y = xp.random.randint(-2, 3, size=N)
+    for i in range(N):
+        x[i] = xp.roll(x[i], (shift_y[i], shift_x[i]), axis=(1, 2))
+
+    return x.reshape(N, -1)   # flatten back for the rest of your pipeline
 
 
 def get_emnist_data(train_path, test_path):

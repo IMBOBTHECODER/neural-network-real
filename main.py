@@ -24,7 +24,7 @@ import pandas as pd
 import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
 from config import Config
-from data_loader import DataLoader, get_data
+from data_loader import DataLoader, get_cifar10_data
 
 
 def clip_grad_norm(grad, max_norm=5.0):
@@ -772,6 +772,7 @@ class NeuralNetwork():
 
 class CNN():
     def __init__(self, config):
+        self.config = config
         self.input_shape = config.input_shape
         self.layers = config.cnn_layer
 
@@ -991,6 +992,83 @@ def build_layer_from_description(desc):
         raise ValueError(f"Unknown layer type in description: {t}")
 
 
+def save_model(cnn, path):
+    if not path.endswith(".npz"):
+        path += ".npz"
+
+    # Build the same config_dict as before
+    config_dict = {
+        'input_shape': list(cnn.config.input_shape),
+        'num_classes': cnn.config.num_classes,
+        'hidden_layer': cnn.config.hidden_layer,
+        'input_node': cnn.config.input_node,
+        'output_node': cnn.config.output_node,
+        'learning_rate': cnn.config.learning_rate,
+        'initial_lr': cnn.config.initial_lr,
+        'beta1': cnn.config.beta1,
+        'beta2': cnn.config.beta2,
+        'eps': cnn.config.eps,
+        'weight_decay': cnn.config.weight_decay,
+        'dropout_rate': cnn.config.dropout_rate,
+        'grad_clip_norm': cnn.config.grad_clip_norm,
+        'batch_size': cnn.config.batch_size,
+        'epochs': cnn.config.epochs,
+        'cnn_layer_desc': [describe_layer(l) for l in cnn.layers],
+    }
+    config_json = json.dumps(config_dict)   # one string, holds the whole architecture
+
+    # Gather every layer's weight state
+    layer_states = [layer.get_state() if hasattr(layer, "get_state") else None for layer in cnn.layers]
+    mlp_state = cnn.mlp.get_state()   # you'd give NeuralNetwork a get_state()/load_state() pair too,
+                                       # mirroring what you built for ConvLayer/BatchNormLayer
+
+    np.savez(
+        path,
+        config_json=config_json,             # the "header"
+        layer_states=np.array(layer_states, dtype=object),
+        mlp_state=np.array(mlp_state, dtype=object),
+    )
+
+
+def load_model(path):
+    if not path.endswith(".npz"):
+        path += ".npz"
+
+    data = np.load(path, allow_pickle=True)
+
+    config_dict = json.loads(str(data['config_json']))   # str() unwraps the 0-d array back to a plain string
+
+    config = Config(
+        input_shape=tuple(config_dict['input_shape']),
+        num_classes=config_dict['num_classes'],
+        hidden_layer=config_dict['hidden_layer'],
+        input_node=config_dict['input_node'],
+        output_node=config_dict['output_node'],
+        learning_rate=config_dict['learning_rate'],
+        initial_lr=config_dict['initial_lr'],
+        beta1=config_dict['beta1'],
+        beta2=config_dict['beta2'],
+        eps=config_dict['eps'],
+        weight_decay=config_dict['weight_decay'],
+        dropout_rate=config_dict['dropout_rate'],
+        grad_clip_norm=config_dict['grad_clip_norm'],
+        batch_size=config_dict['batch_size'],
+        epochs=config_dict['epochs'],
+    )
+    config.cnn_layer = [build_layer_from_description(d) for d in config_dict['cnn_layer_desc']]
+
+    cnn = CNN(config)   # architecture now matches exactly, fresh random weights
+
+    layer_states = data['layer_states']
+    for layer, state in zip(cnn.layers, layer_states):
+        if state is not None and hasattr(layer, "load_state"):
+            layer.load_state(state)
+
+    cnn.mlp.load_state(data['mlp_state'].item())   # .item() unwraps the 0-d object array
+
+    return cnn
+
+
 if __name__ == "__main__":
     config = Config()
     config.cnn_layer = [
@@ -1016,30 +1094,22 @@ if __name__ == "__main__":
     ]
 
     t0 = time.perf_counter()
-    X_train, X_test, Y_train, Y_test = get_data("/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv", "/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv")
-
-    # train_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv', header=None)
-    # test_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv', header=None)
-
-    # Y_train = train_df.iloc[:, 0].to_numpy().astype(np.int32)
-    # X_train = train_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
-
-    # Y_test = test_df.iloc[:, 0].to_numpy().astype(np.int32)
-    # X_test = test_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
-
-    # X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
-    # Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
+    X_train, X_test, Y_train, Y_test = get_cifar10_data('/kaggle/input/datasets/pankrzysiu/cifar10-python/cifar-10-batches-py')
 
     train_loader = DataLoader(
         X_train, Y_train,
         batch_size=config.batch_size,
-        shuffle=True
+        shuffle=True,
+        training=True,
+        image_shape=config.input_shape
     )
 
     test_loader = DataLoader(
         X_test, Y_test,
         batch_size=config.batch_size,
-        shuffle=False
+        shuffle=False,
+        training=False,
+        image_shape=config.input_shape
     )
 
     t1 = time.perf_counter()
