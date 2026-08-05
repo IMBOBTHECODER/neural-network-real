@@ -36,22 +36,29 @@ class DataLoader:
         return (len(self.X) + self.batch_size - 1) // self.batch_size
 
 def augment_batch(x, image_shape):
-    # x: (N, flat_pixels) -> reshape to (N, C, H, W) for spatial transforms
     N = x.shape[0]
     C, H, W = image_shape
     x = x.reshape(N, C, H, W)
 
-    # 1. Random horizontal flip (skip this for EMNIST characters — only use for CIFAR-10-like data)
+    # 1. Flip — same draw as the loop version, same position in the sequence
     flip_mask = xp.random.rand(N) < 0.5
     x[flip_mask] = x[flip_mask, :, :, ::-1]
 
-    # 2. Random small translation (shift up/down/left/right by a few pixels)
-    shift_x = xp.random.randint(-2, 3, size=N)   # e.g. -2 to +2 pixels
+    # 2. Shifts — now drawn in the same order/position as the loop version
+    shift_x = xp.random.randint(-2, 3, size=N)
     shift_y = xp.random.randint(-2, 3, size=N)
-    for i in range(N):
-        x[i] = xp.roll(x[i], (shift_y[i], shift_x[i]), axis=(1, 2))
 
-    return x.reshape(N, -1)   # flatten back for the rest of your pipeline
+    row_idx = (xp.arange(H)[None, :] - shift_y[:, None]) % H
+    col_idx = (xp.arange(W)[None, :] - shift_x[:, None]) % W
+
+    batch_idx = xp.arange(N)[:, None, None, None]
+    chan_idx  = xp.arange(C)[None, :, None, None]
+    row_idx_b = row_idx[:, None, :, None]
+    col_idx_b = col_idx[:, None, None, :]
+
+    shifted = x[batch_idx, chan_idx, row_idx_b, col_idx_b]
+
+    return shifted.reshape(N, -1)
 
 
 def get_emnist_data(train_path, test_path):
