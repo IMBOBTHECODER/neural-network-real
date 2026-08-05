@@ -23,69 +23,17 @@ import time
 import pandas as pd
 import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
-from dataclasses import dataclass, field
+from config import Config
+from data_loader import DataLoader, get_data
 
 
-@dataclass
-class Config:
-    # Data
-    input_shape: tuple = (1, 28, 28)
-    num_classes: int = 47
-
-    # CNN architecture
-    cnn_layer: list = field(default_factory=lambda: [])
-
-    # MLP architecture
-    input_node: int = 784
-    hidden_layer: list = field(default_factory=lambda: [128])
-    output_node: int = 47
-
-    # Optimizer constants
-    learning_rate: float = 1e-3
-    initial_lr: float = 1e-4
-    beta1: float = 0.9
-    beta2: float = 0.999
-    eps: float = 1e-8
-    weight_decay: float = 5e-4
-    dropout_rate: float = 0.25
-
-    # Training
-    batch_size: int = 256
-    epochs: int = 50
-
-
-class DataLoader:
-    def __init__(self, X, Y, batch_size=64, shuffle=True):
-        self.X = X
-        self.Y = Y
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.num_classes = int(xp.max(Y).item()) + 1
-
-    def __iter__(self):
-        indices = xp.arange(len(self.X))
-
-        if self.shuffle:
-            xp.random.shuffle(indices)
-
-        for start in range(0, len(indices), self.batch_size):
-            batch = indices[start:start + self.batch_size]
-
-            x = self.X[batch]
-
-            y = xp.eye(self.num_classes, dtype=xp.float32)[self.Y[batch]]
-
-            yield x, y
-
-    def __len__(self):
-        return (len(self.X) + self.batch_size - 1) // self.batch_size
-
+def clip_grad_norm(grad, max_norm=5.0):
+    norm = xp.sqrt(xp.sum(grad * grad))
+    if norm > max_norm:
+        grad = grad * (max_norm / norm)
+    return grad
 
 # Fused Functions
-
-@compile_fn
-def _bn_normalize(x, mean, var, gamma, beta, eps):
-    return gamma * (x - mean) / xp.sqrt(var + eps) + beta
 
 @compile_fn
 def _adam_step(param, m, v, grad, lr, beta1, beta2, bc1, bc2, eps, wd):
@@ -125,6 +73,7 @@ class ConvLayer():
         self.beta2 = 0.999
         self.eps = 1e-8
         self.weight_decay = 1e-3
+        self.grad_clip_norm = 5.0
 
     def _im2col(self, x, kH, kW, stride=1, padding=0):
         # Rearranges every sliding-window patch into a layout ready to become
@@ -168,6 +117,21 @@ class ConvLayer():
 
         return col, H_out, W_out
 
+    def _im2col_fast(self, x, kH, kW, stride=1, padding=0):
+        N, C, H, W = x.shape
+
+        if padding > 0:
+            x = xp.pad(x, ((0,0),(0,0),(padding,padding),(padding,padding)), mode="constant")
+
+        H_pad, W_pad = x.shape[2], x.shape[3]
+
+        windows = xp.lib.stride_tricks.sliding_window_view(x, (kH, kW), axis=(2, 3))
+        windows = windows[:, :, ::stride, ::stride, :, :]
+
+        H_out, W_out = windows.shape[2], windows.shape[3]
+        col = windows.transpose(0, 1, 4, 5, 2, 3)   # -> (N, C, kH, kW, H_out, W_out)
+
+        return col, H_out, W_out
 
     def _col2im(self, d_col, N, C, kH, kW, H, W):
         stride = self.stride
@@ -201,12 +165,14 @@ class ConvLayer():
         # returns: (N, C_out, H_out, W_out)
 
         self.x_shape = x.shape
+        kernel_shape = self.kernels.shape
+
         N, C, H, W = self.x_shape
-        C_out = self.kernels.shape[0]
-        kH, kW = self.kernels.shape[2], self.kernels.shape[3]
+        C_out = kernel_shape[0]
+        kH, kW = kernel_shape[2], kernel_shape[3]
 
         # Step 1: gather all patches (still in 6D "per kernel-cell" layout)
-        col, self.H_out, self.W_out = self._im2col(x, kH, kW, self.stride, self.padding)
+        col, self.H_out, self.W_out = self._im2col_fast(x, kH, kW, self.stride, self.padding)
 
         # Step 2: reshape into a 2D matrix where each ROW is one flattened patch.
         #
@@ -270,6 +236,10 @@ class ConvLayer():
         # Because one pixel appeared in several patches, its contributions get SUMMED.
         d_x = self._col2im(d_col, N, C, kH, kW, H, W)   # (N, C, H, W) — matches the input
 
+        # Gradient Clipping
+        d_kernels = clip_grad_norm(d_kernels, self.grad_clip_norm)
+        d_bias = clip_grad_norm(d_bias, self.grad_clip_norm)
+
         # Use the kernel gradient to actually update the kernels (Adam does this).
         # Note: this changes self.kernels; it does NOT touch d_x.
         self._adam_update(d_kernels, d_bias)
@@ -300,6 +270,28 @@ class ConvLayer():
             * (1 + math.cos(math.pi * epoch / total_epochs))
             / 2
         )
+
+    def get_state(self):
+        return {
+            'kernels': xp.asnumpy(self.kernels),
+            'bias': xp.asnumpy(self.bias),
+            'kernel_m': xp.asnumpy(self.kernel_m),
+            'kernel_v': xp.asnumpy(self.kernel_v),
+            'bias_m': xp.asnumpy(self.bias_m),
+            'bias_v': xp.asnumpy(self.bias_v),
+            'beta1_pow': self.beta1_pow,
+            'beta2_pow': self.beta2_pow,
+        }
+
+    def load_state(self, state):
+        self.kernels = xp.asarray(state['kernels'])
+        self.bias = xp.asarray(state['bias'])
+        self.kernel_m = xp.asarray(state['kernel_m'])
+        self.kernel_v = xp.asarray(state['kernel_v'])
+        self.bias_m = xp.asarray(state['bias_m'])
+        self.bias_v = xp.asarray(state['bias_v'])
+        self.beta1_pow = float(state['beta1_pow'])
+        self.beta2_pow = float(state['beta2_pow'])
 
 
 class PoolLayer():
@@ -397,13 +389,16 @@ class BatchNormLayer():
         self.beta2 = 0.999
         self.eps = 1e-8
         self.weight_decay = 0.0
+        self.grad_clip_norm = 5.0
 
     def forward(self, x):
         self.x = x
 
         if self.training:
-            self.mean = xp.mean(x, axis=(0, 2, 3), keepdims=True)   # reduction — NOT fusable
-            self.var = xp.var(x, axis=(0, 2, 3), keepdims=True)     # reduction — NOT fusable
+            mean = xp.mean(x, axis=(0, 2, 3), keepdims=True)
+            mean_sq = xp.mean(x * x, axis=(0, 2, 3), keepdims=True)
+            self.mean = mean
+            self.var = mean_sq - mean * mean
 
             self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * self.mean.reshape(-1)
             self.running_var = self.momentum * self.running_var + (1 - self.momentum) * self.var.reshape(-1)
@@ -414,11 +409,8 @@ class BatchNormLayer():
         gamma_r = self.gamma.reshape(1, -1, 1, 1)
         beta_r = self.beta.reshape(1, -1, 1, 1)
 
-        # elementwise chain: fused
-        out = _bn_normalize(x, self.mean, self.var, gamma_r, beta_r, self.eps)
-
-        # cache x_norm separately for backward (small extra cost, but backward needs it)
         self.x_norm = (x - self.mean) / xp.sqrt(self.var + self.eps)
+        out = gamma_r * self.x_norm + beta_r
 
         return out
 
@@ -448,6 +440,10 @@ class BatchNormLayer():
             + (d_var * 2.0 * (self.x - self.mean) / m) \
             + (d_mean / m)
 
+        # Gradient clipping
+        d_gamma = clip_grad_norm(d_gamma, self.grad_clip_norm)
+        d_beta = clip_grad_norm(d_beta, self.grad_clip_norm)
+
         self._adam_update(d_gamma, d_beta)
 
         return d_x
@@ -476,11 +472,37 @@ class BatchNormLayer():
             / 2
         )
 
+    def get_state(self):
+        return {
+            'gamma': xp.asnumpy(self.gamma),
+            'beta': xp.asnumpy(self.beta),
+            'gamma_m': xp.asnumpy(self.gamma_m),
+            'gamma_v': xp.asnumpy(self.gamma_v),
+            'beta_m': xp.asnumpy(self.beta_m),
+            'beta_v': xp.asnumpy(self.beta_v),
+            'running_mean': xp.asnumpy(self.running_mean),
+            'running_var': xp.asnumpy(self.running_var),
+            'beta1_pow': self.beta1_pow,
+            'beta2_pow': self.beta2_pow,
+        }
+
+    def load_state(self, state):
+        self.gamma = xp.asarray(state['gamma'])
+        self.beta = xp.asarray(state['beta'])
+        self.gamma_m = xp.asarray(state['gamma_m'])
+        self.gamma_v = xp.asarray(state['gamma_v'])
+        self.beta_m = xp.asarray(state['beta_m'])
+        self.beta_v = xp.asarray(state['beta_v'])
+        self.running_mean = xp.asarray(state['running_mean'])
+        self.running_var = xp.asarray(state['running_var'])
+        self.beta1_pow = float(state['beta1_pow'])
+        self.beta2_pow = float(state['beta2_pow'])
+
 
 class NeuralNetwork():
     def __init__(self, input_node: int, hidden_layer: list[int], output_node: int,
                 batch_size: int = 64, learning_rate: float = 1e-3, initial_lr: float = 1e-4,
-                beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8, weight_decay: float = 1e-4, dropout_rate = 0.0):
+                beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8, weight_decay: float = 1e-4, dropout_rate = 0.0, grad_clip_norm = 5.0):
         self.layers = [input_node,*hidden_layer, output_node]
         self.size = len(self.layers)
 
@@ -494,6 +516,8 @@ class NeuralNetwork():
         self.beta1 = beta1
         self.beta2 = beta2
         self.weight_decay = weight_decay
+
+        self.grad_clip_norm = grad_clip_norm
 
         self.dropout_rate = dropout_rate
         self.training = True
@@ -601,6 +625,7 @@ class NeuralNetwork():
         wd = self.weight_decay
         beta1 = self.beta1
         beta2 = self.beta2
+        grad_clip_norm = self.grad_clip_norm
 
         self.beta1_pow *= beta1
         self.beta2_pow *= beta2
@@ -614,6 +639,9 @@ class NeuralNetwork():
 
             gradient = self.activations[l].T @ d / batch_size
             bias_gradient = xp.sum(d, axis=0) / batch_size
+
+            gradient = clip_grad_norm(gradient, grad_clip_norm)
+            bias_gradient = clip_grad_norm(bias_gradient, grad_clip_norm)
 
             self.weights[l], self.weight_m[l], self.weight_v[l] = _adam_step(
                 self.weights[l], self.weight_m[l], self.weight_v[l], gradient,
@@ -683,77 +711,68 @@ class NeuralNetwork():
                     f"Loss={total_loss/len(loader):.4f}\n"
                 )
 
+    def get_state(self):
+        return {
+            'weights': [xp.asnumpy(w) for w in self.weights],
+            'biases': [xp.asnumpy(b) for b in self.biases],
+            'weight_m': [xp.asnumpy(m) for m in self.weight_m],
+            'weight_v': [xp.asnumpy(v) for v in self.weight_v],
+            'bias_m': [xp.asnumpy(m) for m in self.bias_m],
+            'bias_v': [xp.asnumpy(v) for v in self.bias_v],
+            'learning_rate': self.learning_rate,
+            'initial_lr': self.initial_lr,
+            'beta1': self.beta1,
+            'beta2': self.beta2,
+            'eps': self.eps,
+            'weight_decay': self.weight_decay,
+            'grad_clip_norm': self.grad_clip_norm,
+            'dropout_rate': self.dropout_rate,
+            'batch_size': self.batch_size,
+            'training_step': self.training_step,
+            'beta1_pow': self.beta1_pow,
+            'beta2_pow': self.beta2_pow,
+        }
+
+    def load_state(self, state):
+        self.weights = [xp.asarray(w) for w in state['weights']]
+        self.biases = [xp.asarray(b) for b in state['biases']]
+        self.weight_m = [xp.asarray(m) for m in state['weight_m']]
+        self.weight_v = [xp.asarray(v) for v in state['weight_v']]
+        self.bias_m = [xp.asarray(m) for m in state['bias_m']]
+        self.bias_v = [xp.asarray(v) for v in state['bias_v']]
+
+        self.learning_rate = float(state['learning_rate'])
+        self.initial_lr = float(state['initial_lr'])
+        self.beta1 = float(state['beta1'])
+        self.beta2 = float(state['beta2'])
+        self.eps = float(state['eps'])
+        self.weight_decay = float(state['weight_decay'])
+        self.grad_clip_norm = float(state['grad_clip_norm'])
+        self.dropout_rate = float(state['dropout_rate'])
+        self.batch_size = int(state['batch_size'])
+        self.training_step = int(state['training_step'])
+        self.beta1_pow = float(state['beta1_pow'])
+        self.beta2_pow = float(state['beta2_pow'])
+
     def save(self, path: str = "model.npz"):
         if not path.endswith(".npz"):
             path += ".npz"
 
-        np.savez(
-            path,
-
-            weights=np.array([xp.asnumpy(w) for w in self.weights], dtype=object),
-            biases=np.array([xp.asnumpy(b) for b in self.biases], dtype=object),
-
-            weights_m=np.array([xp.asnumpy(m) for m in self.weight_m], dtype=object),
-            weights_v=np.array([xp.asnumpy(v) for v in self.weight_v], dtype=object),
-
-            biases_m=np.array([xp.asnumpy(m) for m in self.bias_m], dtype=object),
-            biases_v=np.array([xp.asnumpy(v) for v in self.bias_v], dtype=object),
-
-            hyperparameter=np.array([
-                self.learning_rate,
-                self.initial_lr,
-                self.beta1,
-                self.beta2,
-                self.eps,
-                self.weight_decay,
-                self.batch_size
-            ], dtype=np.float32),
-
-            training_step=self.training_step,
-            beta1_pow=self.beta1_pow,
-            beta2_pow=self.beta2_pow
-        )
+        state = self.get_state()
+        np.savez(path, state=np.array(state, dtype=object))
 
     def load(self, path: str = "model.npz"):
         if not path.endswith(".npz"):
             path += ".npz"
 
         data = np.load(path, allow_pickle=True)
-
-        self.weights = [xp.asarray(w) for w in data["weights"]]
-        self.biases = [xp.asarray(b) for b in data["biases"]]
-
-        self.weight_m = [xp.asarray(m) for m in data["weights_m"]]
-        self.weight_v = [xp.asarray(v) for v in data["weights_v"]]
-
-        self.bias_m = [xp.asarray(m) for m in data["biases_m"]]
-        self.bias_v = [xp.asarray(v) for v in data["biases_v"]]
-
-        (
-            self.learning_rate,
-            self.initial_lr,
-            self.beta1,
-            self.beta2,
-            self.eps,
-            self.weight_decay,
-            self.batch_size,
-        ) = data["hyperparameter"]
-
-        self.learning_rate = float(self.learning_rate)
-        self.initial_lr = float(self.initial_lr)
-        self.beta1 = float(self.beta1)
-        self.beta2 = float(self.beta2)
-        self.eps = float(self.eps)
-        self.weight_decay = float(self.weight_decay)
-        self.batch_size = int(self.batch_size)
-
-        self.training_step = int(data["training_step"])
-        self.beta1_pow = float(data["beta1_pow"])
-        self.beta2_pow = float(data["beta2_pow"])
+        state = data['state'].item()   # .item() unwraps the 0-d object array back to the dict
+        self.load_state(state)
 
 
 class CNN():
     def __init__(self, config):
+        self.input_shape = config.input_shape
         self.layers = config.cnn_layer
 
         # Inject optimizer hyperparameters into every conv layer (once, from config)
@@ -765,6 +784,7 @@ class CNN():
                 layer.beta2 = config.beta2
                 layer.eps = config.eps
                 layer.weight_decay = config.weight_decay
+                layer.grad_clip_norm = config.grad_clip_norm
 
             if isinstance(layer, BatchNormLayer):
                 layer.learning_rate = config.learning_rate
@@ -773,6 +793,7 @@ class CNN():
                 layer.beta2 = config.beta2
                 layer.eps = config.eps
                 layer.weight_decay = 0.0   # deliberately NOT config.weight_decay
+                layer.grad_clip_norm = config.grad_clip_norm
 
         flatten_size = self._compute_flatten_size(config.input_shape)
 
@@ -788,13 +809,14 @@ class CNN():
             beta2=config.beta2,
             eps=config.eps,
             weight_decay=config.weight_decay,
-            dropout_rate=config.dropout_rate
+            dropout_rate=config.dropout_rate,
+            grad_clip_norm=config.grad_clip_norm
         )
 
     def forward(self, x):
         # x arrives as (batch, 784) flat from your DataLoader
         batch = x.shape[0]
-        x = x.reshape(batch, 1, 28, 28)   # unflatten to image
+        x = x.reshape(batch, *self.input_shape)   # unflatten to image
 
         for layer in self.layers:
             x = layer.forward(x)          # conv/pool/activation, uniform interface
@@ -892,6 +914,82 @@ class CNN():
             if hasattr(layer, "training"):
                 layer.training = training
 
+    def save(self, path: str = "cnn_model.npz"):
+        if not path.endswith(".npz"):
+            path += ".npz"
+
+        layer_states = []
+        for layer in self.layers:
+            if hasattr(layer, "get_state"):
+                layer_states.append(layer.get_state())
+            else:
+                layer_states.append(None)   # Pool/Activation — nothing to save
+
+        np.savez(
+            path,
+            layer_states=np.array(layer_states, dtype=object),
+        )
+
+        # MLP gets its own file (reuses NeuralNetwork.save as-is)
+        mlp_path = path.replace(".npz", "_mlp.npz")
+        self.mlp.save(mlp_path)
+
+    def load(self, path: str = "cnn_model.npz"):
+        if not path.endswith(".npz"):
+            path += ".npz"
+
+        data = np.load(path, allow_pickle=True)
+        layer_states = data["layer_states"]
+
+        for layer, state in zip(self.layers, layer_states):
+            if state is not None and hasattr(layer, "load_state"):
+                layer.load_state(state)
+
+        mlp_path = path.replace(".npz", "_mlp.npz")
+        self.mlp.load(mlp_path)
+
+def describe_layer(layer):
+    if isinstance(layer, ConvLayer):
+        return {
+            'type': 'ConvLayer',
+            'in_channels': int(layer.kernels.shape[1]),
+            'out_channels': int(layer.kernels.shape[0]),
+            'kernel_size': int(layer.kernels.shape[2]),
+            'stride': layer.stride,
+            'padding': layer.padding,
+        }
+    elif isinstance(layer, BatchNormLayer):
+        return {
+            'type': 'BatchNormLayer',
+            'num_channels': layer.num_channels,
+            'momentum': layer.momentum,
+        }
+    elif isinstance(layer, PoolLayer):
+        return {
+            'type': 'PoolLayer',
+            'pool_size': layer.pool_size,
+            'stride': layer.stride,
+        }
+    elif isinstance(layer, ActivationLayer):
+        return {'type': 'ActivationLayer'}
+    else:
+        raise ValueError(f"Unknown layer type: {type(layer).__name__}")
+
+
+def build_layer_from_description(desc):
+    t = desc['type']
+    if t == 'ConvLayer':
+        return ConvLayer(desc['in_channels'], desc['out_channels'], desc['kernel_size'],
+                        stride=desc['stride'], padding=desc['padding'])
+    elif t == 'BatchNormLayer':
+        return BatchNormLayer(desc['num_channels'], momentum=desc['momentum'])
+    elif t == 'PoolLayer':
+        return PoolLayer(desc['pool_size'], desc['stride'])
+    elif t == 'ActivationLayer':
+        return ActivationLayer()
+    else:
+        raise ValueError(f"Unknown layer type in description: {t}")
+
 
 if __name__ == "__main__":
     config = Config()
@@ -918,17 +1016,19 @@ if __name__ == "__main__":
     ]
 
     t0 = time.perf_counter()
-    train_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv', header=None)
-    test_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv', header=None)
+    X_train, X_test, Y_train, Y_test = get_data("/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv", "/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv")
 
-    Y_train = train_df.iloc[:, 0].to_numpy().astype(np.int32)
-    X_train = train_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
+    # train_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-train.csv', header=None)
+    # test_df = pd.read_csv('/kaggle/input/datasets/crawford/emnist/emnist-bymerge-test.csv', header=None)
 
-    Y_test = test_df.iloc[:, 0].to_numpy().astype(np.int32)
-    X_test = test_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
+    # Y_train = train_df.iloc[:, 0].to_numpy().astype(np.int32)
+    # X_train = train_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
 
-    X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
-    Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
+    # Y_test = test_df.iloc[:, 0].to_numpy().astype(np.int32)
+    # X_test = test_df.iloc[:, 1:].to_numpy().astype(np.float32) / 255.0
+
+    # X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
+    # Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
 
     train_loader = DataLoader(
         X_train, Y_train,
