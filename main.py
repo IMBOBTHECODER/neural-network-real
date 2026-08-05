@@ -1072,7 +1072,7 @@ def load_model(path):
 if __name__ == "__main__":
     config = Config()
     config.cnn_layer = [
-        ConvLayer(1, 16, 3, padding=1),
+        ConvLayer(3, 16, 3, padding=1),
         BatchNormLayer(16, momentum=0.9),
         ActivationLayer(),
 
@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
     xp.cuda.Stream.null.synchronize()
     print(f"Time taken: {time.perf_counter() - t2}s")
 
-    # nn.save("emnist1.npz")
+    nn.save("cifar10.npz")
 
     loss, acc = nn.evaluate(test_loader)
 
