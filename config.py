@@ -25,5 +25,5 @@ class Config:
     grad_clip_norm: float = 5.0
 
     # Training
-    batch_size: int = 256
-    epochs: int = 5
+    batch_size: int = 128
+    epochs: int = 80

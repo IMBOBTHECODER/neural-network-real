@@ -20,7 +20,7 @@ else:
         NUMBA_AVAILABLE = False
 
 import time
-import pandas as pd
+import json
 import math
 from activation import LeakyReLU, LeakyReLU_derivative, softmax
 from config import Config
@@ -499,6 +499,49 @@ class BatchNormLayer():
         self.beta2_pow = float(state['beta2_pow'])
 
 
+class ResidualBlock():
+    def __init__(self, sub_layers):
+        self.sub_layers = sub_layers
+        self.final_activation = ActivationLayer()
+
+    def forward(self, x):
+        self.x_in = x
+        out = x
+        for layer in self.sub_layers:
+            out = layer.forward(out)
+        return self.final_activation.forward(out + self.x_in)
+
+    def backward(self, grad):
+        grad = self.final_activation.backward(grad)
+        grad_F = grad
+        for layer in reversed(self.sub_layers):
+            grad_F = layer.backward(grad_F)
+        return grad_F + grad
+
+    def set_training(self, training):
+        for layer in self.sub_layers:
+            if hasattr(layer, "training"):
+                layer.training = training
+
+    def update_lr(self, epoch, total_epochs):
+        for layer in self.sub_layers:
+            if hasattr(layer, "update_lr"):
+                layer.update_lr(epoch, total_epochs)
+
+    def get_state(self):
+        return {
+            'sub_layer_states': [
+                layer.get_state() if hasattr(layer, "get_state") else None
+                for layer in self.sub_layers
+            ]
+        }
+
+    def load_state(self, state):
+        for layer, sub_state in zip(self.sub_layers, state['sub_layer_states']):
+            if sub_state is not None and hasattr(layer, "load_state"):
+                layer.load_state(sub_state)
+
+
 class NeuralNetwork():
     def __init__(self, input_node: int, hidden_layer: list[int], output_node: int,
                 batch_size: int = 64, learning_rate: float = 1e-3, initial_lr: float = 1e-4,
@@ -776,8 +819,7 @@ class CNN():
         self.input_shape = config.input_shape
         self.layers = config.cnn_layer
 
-        # Inject optimizer hyperparameters into every conv layer (once, from config)
-        for layer in self.layers:
+        def inject(layer):
             if isinstance(layer, ConvLayer):
                 layer.learning_rate = config.learning_rate
                 layer.initial_lr = config.initial_lr
@@ -786,21 +828,25 @@ class CNN():
                 layer.eps = config.eps
                 layer.weight_decay = config.weight_decay
                 layer.grad_clip_norm = config.grad_clip_norm
-
-            if isinstance(layer, BatchNormLayer):
+            elif isinstance(layer, BatchNormLayer):
                 layer.learning_rate = config.learning_rate
                 layer.initial_lr = config.initial_lr
                 layer.beta1 = config.beta1
                 layer.beta2 = config.beta2
                 layer.eps = config.eps
-                layer.weight_decay = 0.0   # deliberately NOT config.weight_decay
+                layer.weight_decay = 0.0
                 layer.grad_clip_norm = config.grad_clip_norm
+            elif isinstance(layer, ResidualBlock):
+                for sub_layer in layer.sub_layers:
+                    inject(sub_layer)   # recurse
+
+        for layer in self.layers:
+            inject(layer)
 
         flatten_size = self._compute_flatten_size(config.input_shape)
 
-        # The MLP tail — input_node is the FLATTEN SIZE, not 784
         self.mlp = NeuralNetwork(
-            input_node=flatten_size,   # <-- must be the post-conv flatten size
+            input_node=flatten_size,
             hidden_layer=config.hidden_layer,
             output_node=config.output_node,
             batch_size=config.batch_size,
@@ -839,7 +885,9 @@ class CNN():
     def update_lr(self, epoch, total_epochs):
         self.mlp.update_lr(epoch, total_epochs)     # the MLP tail
         for layer in self.layers:
-            if hasattr(layer, "update_lr"):          # conv layers have it; pool/activation don't
+            if isinstance(layer, ResidualBlock):
+                layer.update_lr(epoch, total_epochs)
+            elif hasattr(layer, "update_lr"):          # conv layers have it; pool/activation don't
                 layer.update_lr(epoch, total_epochs)
 
     def train(self, loader, epochs):
@@ -912,7 +960,9 @@ class CNN():
     def set_training(self, training):
         self.mlp.training = training
         for layer in self.layers:
-            if hasattr(layer, "training"):
+            if isinstance(layer, ResidualBlock):
+                layer.set_training(training)
+            elif hasattr(layer, "training"):
                 layer.training = training
 
     def save(self, path: str = "cnn_model.npz"):
@@ -973,6 +1023,11 @@ def describe_layer(layer):
         }
     elif isinstance(layer, ActivationLayer):
         return {'type': 'ActivationLayer'}
+    elif isinstance(layer, ResidualBlock):
+        return {
+            'type': 'ResidualBlock',
+            'sub_layers': [describe_layer(l) for l in layer.sub_layers],
+        }
     else:
         raise ValueError(f"Unknown layer type: {type(layer).__name__}")
 
@@ -988,6 +1043,9 @@ def build_layer_from_description(desc):
         return PoolLayer(desc['pool_size'], desc['stride'])
     elif t == 'ActivationLayer':
         return ActivationLayer()
+    elif t == 'ResidualBlock':
+        sub_layers = [build_layer_from_description(d) for d in desc['sub_layers']]
+        return ResidualBlock(sub_layers)
     else:
         raise ValueError(f"Unknown layer type in description: {t}")
 
@@ -1076,19 +1134,27 @@ if __name__ == "__main__":
         BatchNormLayer(16, momentum=0.9),
         ActivationLayer(),
 
-        ConvLayer(16, 16, 3, padding=1),
-        BatchNormLayer(16, momentum=0.9),
-        ActivationLayer(),
+        ResidualBlock([
+            ConvLayer(16, 16, 3, padding=1),
+            BatchNormLayer(16, momentum=0.9),
+            ActivationLayer(),
+            ConvLayer(16, 16, 3, padding=1),
+            BatchNormLayer(16, momentum=0.9),
+        ]),
 
         PoolLayer(2, 2),
 
-        ConvLayer(16, 32, 3, padding=1),
+        ConvLayer(16, 32, 3, padding=1),   # channel change happens HERE, plainly
         BatchNormLayer(32, momentum=0.9),
         ActivationLayer(),
 
-        ConvLayer(32, 32, 3, padding=1),
-        BatchNormLayer(32, momentum=0.9),
-        ActivationLayer(),
+        ResidualBlock([
+            ConvLayer(32, 32, 3, padding=1),
+            BatchNormLayer(32, momentum=0.9),
+            ActivationLayer(),
+            ConvLayer(32, 32, 3, padding=1),
+            BatchNormLayer(32, momentum=0.9),
+        ]),
 
         PoolLayer(2, 2),
     ]
