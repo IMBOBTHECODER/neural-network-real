@@ -1195,7 +1195,14 @@ if __name__ == "__main__":
 
     nn.save("cifar10.npz")
 
+    train_loss, train_acc = nn.evaluate(train_loader)
+
     loss, acc = nn.evaluate(test_loader)
 
+    print("Test:")
     print(f"Loss: {loss:.4f}")
-    print(f"Accuracy: {acc:.2%}")
+    print(f"Accuracy: {acc:.2%}\n")
+    
+    print("Train:")
+    print(f"Loss: {train_loss:.4f}") 
+    print(f"Accuracy: {train_acc:.2%}")
