@@ -207,9 +207,11 @@ class ConvLayer():
         # Our job: (1) find how to update our kernels, (2) find the gradient to
         # hand back to the layer BEFORE us. Then return (2).
 
+        kernel_shape = self.kernels.shape
+
         N, C, H, W = self.x_shape                       # the input shape we saw in forward
-        C_out = self.kernels.shape[0]                   # number of kernels / output channels
-        kH, kW = self.kernels.shape[2], self.kernels.shape[3]
+        C_out = kernel_shape[0]                   # number of kernels / output channels
+        kH, kW = kernel_shape[2], kernel_shape[3]
 
         # Flatten d_out so it lines up with self.col (the flattened patches from forward).
         # We want one row per output position, matching how col was built.
@@ -400,8 +402,9 @@ class BatchNormLayer():
             self.mean = mean
             self.var = mean_sq - mean * mean
 
-            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * self.mean.reshape(-1)
-            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * self.var.reshape(-1)
+            momentum = self.momentum
+            self.running_mean = momentum * self.running_mean + (1 - momentum) * self.mean.reshape(-1)
+            self.running_var = momentum * self.running_var + (1 - momentum) * self.var.reshape(-1)
         else:
             self.mean = self.running_mean.reshape(1, -1, 1, 1)
             self.var = self.running_var.reshape(1, -1, 1, 1)
@@ -420,7 +423,6 @@ class BatchNormLayer():
         m = N * H * W   # number of elements averaged per channel
 
         gamma = self.gamma
-        beta = self.beta
         x_norm = self.x_norm
 
         d_gamma = xp.sum(d_out * x_norm, axis=(0, 2, 3))
@@ -1197,7 +1199,15 @@ if __name__ == "__main__":
 
     nn.save("cifar10.npz")
 
-    train_loss, train_acc = nn.evaluate(train_loader)
+    train_eval_loader = DataLoader(
+        X_train, Y_train,
+        batch_size=config.batch_size,
+        shuffle=False,
+        training=False,      # augmentation OFF for evaluation
+        image_shape=config.input_shape
+    )
+
+    train_loss, train_acc = nn.evaluate(train_eval_loader)
 
     loss, acc = nn.evaluate(test_loader)
 

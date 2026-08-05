@@ -26,4 +26,4 @@ class Config:
 
     # Training
     batch_size: int = 256
-    epochs: int = 100
+    epochs: int = 75
