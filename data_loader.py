@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pickle
+from PIL import Image
 import os
 try:
     import cupy as xp
@@ -35,30 +36,36 @@ class DataLoader:
     def __len__(self):
         return (len(self.X) + self.batch_size - 1) // self.batch_size
 
-def augment_batch(x, image_shape):
+def augment_batch(x, image_shape, pad=4):
     N = x.shape[0]
     C, H, W = image_shape
     x = x.reshape(N, C, H, W)
 
-    # 1. Flip — same draw as the loop version, same position in the sequence
+    # 1. Flip — same as before
     flip_mask = xp.random.rand(N) < 0.5
     x[flip_mask] = x[flip_mask, :, :, ::-1]
 
-    # 2. Shifts — now drawn in the same order/position as the loop version
-    shift_x = xp.random.randint(-2, 3, size=N)
-    shift_y = xp.random.randint(-2, 3, size=N)
+    # 2. Pad with zeros on all sides
+    x_padded = xp.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode="constant")
+    H_pad, W_pad = H + 2 * pad, W + 2 * pad
 
-    row_idx = (xp.arange(H)[None, :] - shift_y[:, None]) % H
-    col_idx = (xp.arange(W)[None, :] - shift_x[:, None]) % W
+    # 3. Random crop position per image (top-left corner of the crop window)
+    max_offset = 2 * pad
+    offset_y = xp.random.randint(0, max_offset + 1, size=N)
+    offset_x = xp.random.randint(0, max_offset + 1, size=N)
+
+    # 4. Vectorized gather — same pattern as your shift augmentation, no modulo needed
+    row_idx = offset_y[:, None] + xp.arange(H)[None, :]      # (N, H)
+    col_idx = offset_x[:, None] + xp.arange(W)[None, :]      # (N, W)
 
     batch_idx = xp.arange(N)[:, None, None, None]
-    chan_idx  = xp.arange(C)[None, :, None, None]
+    chan_idx = xp.arange(C)[None, :, None, None]
     row_idx_b = row_idx[:, None, :, None]
     col_idx_b = col_idx[:, None, None, :]
 
-    shifted = x[batch_idx, chan_idx, row_idx_b, col_idx_b]
+    cropped = x_padded[batch_idx, chan_idx, row_idx_b, col_idx_b]
 
-    return shifted.reshape(N, -1)
+    return cropped.reshape(N, -1)
 
 
 def get_emnist_data(train_path, test_path):
@@ -122,6 +129,47 @@ def get_cifar10_data(data_dir):
     test_data, test_labels = _load_cifar10_batch(test_path)
     X_test = test_data.astype(np.float32) / 255.0
     Y_test = np.array(test_labels, dtype=np.int32)
+
+    X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
+    Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
+
+    return X_train, X_test, Y_train, Y_test
+
+def get_gtsrb_data(base_dir, target_size=32, use_roi=True):
+    """
+    Loads GTSRB from the standard Kaggle layout:
+        base_dir/Train.csv, base_dir/Test.csv
+        base_dir/Train/<ClassId>/<image>.png, base_dir/Test/<image>.png
+    Each CSV row: Width, Height, Roi.X1, Roi.Y1, Roi.X2, Roi.Y2, ClassId, Path
+
+    Returns flat (N, target_size*target_size*3) float32 arrays, normalized to [0,1].
+    """
+    def load_split(csv_path):
+        df = pd.read_csv(csv_path)
+        images = []
+        labels = []
+
+        for _, row in df.iterrows():
+            img_path = os.path.join(base_dir, row["Path"])
+            img = Image.open(img_path).convert("RGB")
+
+            if use_roi:
+                img = img.crop((row["Roi.X1"], row["Roi.Y1"], row["Roi.X2"], row["Roi.Y2"]))
+
+            img = img.resize((target_size, target_size))
+            images.append(np.array(img, dtype=np.uint8))
+
+            labels.append(int(row["ClassId"]))
+
+        X = np.stack(images, axis=0)
+        X = X.transpose(0, 3, 1, 2)
+        X = X.astype(np.float32).reshape(len(X), -1) / 255.0
+
+        Y = np.array(labels, dtype=np.int32)
+        return X, Y
+
+    X_train, Y_train = load_split(os.path.join(base_dir, "Train.csv"))
+    X_test, Y_test = load_split(os.path.join(base_dir, "Test.csv"))
 
     X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
     Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
