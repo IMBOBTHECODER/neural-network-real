@@ -168,7 +168,8 @@ def train(model, train_loader, optimizer, scheduler, loss_fn, epochs, device,
             total_loss += loss.item()
 
         scheduler.step()
-        print(f"Epoch {epoch}: Loss={total_loss/len(train_loader):.4f}")
+        if (epoch + 1) % 2 == 0:
+            print(f"Epoch {epoch}: Loss={total_loss/len(train_loader):.4f}")
 
         if checkpoint_path and (epoch + 1) % checkpoint_every == 0:
             save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, config)

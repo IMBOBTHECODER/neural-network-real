@@ -17,7 +17,7 @@ class Config:
 
     # Optimizer constants
     learning_rate: float = 1e-2
-    initial_lr: float = 1e-3    # Unused
+    initial_lr: float = 1e-3
     beta1: float = 0.9
     beta2: float = 0.999
     eps: float = 1e-8
@@ -28,4 +28,4 @@ class Config:
     # Training
     batch_size: int = 256
     epochs: int = 50
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn: torch.nn.Module = field(default_factory=torch.nn.CrossEntropyLoss)
