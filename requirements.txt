@@ -4,3 +4,5 @@ cupy-cuda12x
 numba
 pandas
 Pillow
+torch
+torchvision

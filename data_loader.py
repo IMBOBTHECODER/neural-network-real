@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import pickle
+import torch
+from torch.utils.data import Dataset
 from PIL import Image
 import os
 try:
@@ -35,6 +37,22 @@ class DataLoader:
 
     def __len__(self):
         return (len(self.X) + self.batch_size - 1) // self.batch_size
+
+class CIFAR10Dataset(Dataset):
+    def __init__(self, X, Y, transform=None):
+        # X: numpy array (N, 3072) or (N, 3, 32, 32), Y: numpy array (N,) plain integer labels
+        self.X = torch.tensor(X, dtype=torch.float32).reshape(-1, 3, 32, 32)
+        self.Y = torch.tensor(Y, dtype=torch.long)   # CrossEntropyLoss needs int64 ("long"), not int32
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx]
+        if self.transform:
+            x = self.transform(x)
+        return x, self.Y[idx]
 
 def augment_batch(x, image_shape, pad=4):
     N = x.shape[0]
@@ -132,6 +150,35 @@ def get_cifar10_data(data_dir):
 
     X_train, X_test = xp.asarray(X_train), xp.asarray(X_test)
     Y_train, Y_test = xp.asarray(Y_train), xp.asarray(Y_test)
+
+    return X_train, X_test, Y_train, Y_test
+
+def get_cifar10_data_torch(data_dir):
+    """
+    Loads CIFAR-10 from the standard 'cifar-10-batches-py' directory structure
+    (5 training batch files + 1 test batch file, as distributed by the
+    official CIFAR-10 release and most Kaggle mirrors of it).
+
+    Returns FLAT (N, 3072) float32 arrays, normalized to [0, 1], in the same
+    "channel-major flattened" order the raw files use — matching how your
+    CNN.forward reshapes flat input back to (C, H, W).
+    """
+    train_data_list = []
+    train_labels_list = []
+
+    for i in range(1, 6):
+        batch_path = os.path.join(data_dir, f"data_batch_{i}")
+        data, labels = _load_cifar10_batch(batch_path)
+        train_data_list.append(data)
+        train_labels_list.extend(labels)
+
+    X_train = np.concatenate(train_data_list, axis=0).astype(np.float32) / 255.0
+    Y_train = np.array(train_labels_list, dtype=np.int32)
+
+    test_path = os.path.join(data_dir, "test_batch")
+    test_data, test_labels = _load_cifar10_batch(test_path)
+    X_test = test_data.astype(np.float32) / 255.0
+    Y_test = np.array(test_labels, dtype=np.int32)
 
     return X_train, X_test, Y_train, Y_test
 
